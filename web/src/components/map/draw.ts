@@ -1,10 +1,17 @@
 // The per-frame draw of the bubble map, written to allocate nothing per node. Order of a frame:
 //  1. positions interpolated between the last two worker frames into the store's typed arrays, radii tweened;
 //  2. camera (camera.ts): a van Wijk flight, follow or auto-fit step; d3-zoom is synced when it moved;
-//  3. dotted ground, then tree hulls (one neutral tint, fading out between k = 0.6 and 1.6; the active
-//     tree lime, with a hairline circle at any zoom);
-//  4. links batched per colour (dimmed ones apart); ambient flow dots only on links whose child traded
-//     in the last 30 min, hovered links with their own dots on top;
+//  3. dotted ground, then tree hulls (one neutral tint padded around the member centres, fading out
+//     between k = 0.6 and 1.6; the active tree a touch stronger with a faint lime rim, plus a hairline
+//     circle at any zoom). During a drag the store carries the tree's hull and anchors along (a whole
+//     tree is translated, a reshaped one re-measured before the frame), so they travel with the bubbles;
+//  4. links batched per colour and family size: families over 200 / 800 members draw lighter, thinner
+//     links (the largest in one neutral tint) and drop the short ones when zoomed out (dimmed ones
+//     apart); a hub (> 60 children) strokes its spokes once with a radial gradient that fades them in
+//     from the hub, so they never pile up into a bright knot on it; ambient flow dots only on links
+//     whose child traded in the last 30 min, at most 48 per family per frame. A hovered or selected coin
+//     lights its own child links as one thin stroke (fainter the more children it has, ≤ 36 dots) and
+//     its ancestor path brighter; nothing is lit or dimmed while a bubble is being dragged;
 //  5. trade fx (fx.ts): ripples, $500+ flashes and routed-buy comets;
 //  6. bubbles, smallest first, in tiers by screen radius: specks (< 2.5 px) batched into rect fills;
 //     small bubbles (< 7 px) as batched vectors (one halo fill, one body fill and one ring stroke per
@@ -24,7 +31,7 @@ import { imageFor } from "../../lib/map/images";
 import type { SizeMode } from "../../lib/map/types";
 import { stepCamera, type Flight } from "./camera";
 import { drawFx, makeFx, type Fx } from "./fx";
-import { COLORS, F_ANC, F_FOCUS, F_MATCH, F_MIG, F_OURS, HULL, MapStore } from "./store";
+import { COLORS, F_ANC, F_FOCUS, F_MATCH, F_MIG, F_OURS, HULL, MapStore, type Cluster } from "./store";
 import { GLOW, MAX_SPRITE_R, MONO, SB_ANC, SB_MIG, bucketR, drawCap, gridPattern, labelOf, letterKey, letterSprite, makeSprites, renderBody, renderLabel, sharedSprite, titleSprite, type SpriteSet } from "./sprites";
 
 export { centerOn, fitFor } from "./camera";
@@ -41,7 +48,22 @@ export const MAX_TITLES = 40, MAX_TITLES_PHONE = 12;
 export const BEACON_R = 4;
 /// Ambient link dots only on pairs that traded this recently.
 export const DOT_RECENT_MS = 30 * 60_000;
-const MAX_DOT_LINKS = 6000, HOT_CAP = 512, BEACON_CAP = 512;
+const MAX_DOT_LINKS = 6000, BEACON_CAP = 512;
+/// Family size classes for links: normal, big (> BIG_FAMILY members), huge (> HUGE_FAMILY).
+export const BIG_FAMILY = 200, HUGE_FAMILY = 800;
+/// Link stroke alpha / width per class, and the shortest link drawn (screen px between the rims) per
+/// class when zoomed out (k < 1) and in: a 1 300-coin family is a texture, not 1 300 bright spokes.
+const LINK_A = [0.26, 0.17, 0.13], LINK_W = [1, 0.85, 0.75], LINK_MIN_OUT = [2, 5, 8], LINK_MIN_IN = [2, 3, 3];
+/// A parent with more children than this is a hub: its links go into one stroke whose radial gradient
+/// fades in from the hub, so hundreds of spokes do not pile up into a bright knot on it (≤ HUB_SLOTS
+/// hubs per frame; the rest batch as usual).
+export const HUB_FAN = 60;
+const HUB_SLOTS = 32;
+/// Ambient dots per family per frame; dots on a lit coin's child links.
+export const DOTS_PER_FAMILY = 48, HOT_DOTS = 36;
+/// Hull padding around the member centres (world units): the outer members' typical radius, capped, so
+/// a family with one giant root is not wrapped in a blob as wide as that root.
+const HULL_PAD_CAP = 12, HULL_PAD = 10;
 const BUILD_MAX = 12, BUILD_GESTURE = 2, BUILD_MS = 4;
 const RECTS = MAX_LABELS + MAX_TITLES;
 
@@ -62,7 +84,7 @@ export type State = {
   hover: number; pinned: number; selected: number; focusIdx: number; follow: { i: number; k: number } | null;
   raf: number; visible: boolean; autoFit: boolean; focus: string | undefined; static: boolean; inset: Inset;
   onSelect: ((i: number) => void) | undefined; tweenUntil: number; hullTick: number;
-  labelRects: Float32Array; hot: Int32Array; perf: Perf;
+  labelRects: Float32Array; perf: Perf;
   /// layout inputs the worker needs again on a re-init (canvas height for the focus column, ancestor shift)
   hPx: number; hasAnc: boolean;
   /// camera flight in progress (camera.ts), the time of the last drawn frame, and the end of the current
@@ -80,7 +102,7 @@ export function makeState(init: { mode: SizeMode; focus: string | undefined; ins
   return {
     store: new MapStore(), sprites: makeSprites(), mode: init.mode, t: zoomIdentity, zoom: null, w: 0, h: 0, dpr: 1,
     hover: -1, pinned: -1, selected: -1, focusIdx: -1, follow: null, raf: 0, visible: true, autoFit: true, focus: init.focus, static: init.static, inset: init.inset,
-    onSelect: undefined, tweenUntil: 0, hullTick: 0, labelRects: new Float32Array(RECTS * 4), hot: new Int32Array(HOT_CAP), perf: makePerf(), hPx: 600, hasAnc: false,
+    onSelect: undefined, tweenUntil: 0, hullTick: 0, labelRects: new Float32Array(RECTS * 4), perf: makePerf(), hPx: 600, hasAnc: false,
     flight: null, lastFrameAt: 0, zoomingUntil: 0, hoverCluster: -1, highlight: false, fx: makeFx(),
   };
 }
@@ -127,6 +149,12 @@ const exactA = (hex: string, a: number) => `rgba(${rgbOf(hex)},${Math.round(a * 
 const SMALL_HALO = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.11 * m)));
 const SMALL_FILL = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.42 * m)));
 const SMALL_RING = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.8 * m)));
+/// link strokes per (class, colour), then dimmed/faint ones per colour (key 12 + colour)
+/// (huge families: one neutral tint at key 8, whatever the depth: a 1 000-coin family is a texture)
+const LINK_STYLE = [...LINK_A.flatMap((a, cls) => COLORS.map((c) => exactA(cls === 2 ? HULL : c, a))), ...COLORS.map((c) => exactA(c, 0.05))];
+/// hub gradient stops per colour (depth colours, then the neutral tint at 4): [transparent, class 0, 1, 2, dimmed]
+const HUB_STOP = [...COLORS, HULL].map((c) => [exactA(c, 0), ...LINK_A.map((a) => exactA(c, a)), exactA(c, 0.05)]);
+const LINK_DIM_W = 0.8;
 const HALO_R = 1.6, TAU = Math.PI * 2;
 const BEACON_RING = ca(LIME_A, 0.95), BEACON_HALO = ca(LIME_A, 0.35), BEACON_DIM = ca(LIME_A, 0.3);
 const fontCache = new Map<number, string>();
@@ -138,7 +166,18 @@ let HOV = -1, SEL = -1, DIMMING = false, HL = false;
 let curAlpha = 1, drawnN = 0;
 let builds = 0, buildLimit = BUILD_MAX, buildT0 = 0, buildOver = false;
 const nulls = (len: number): (Path2D | null)[] => Array.from({ length: len }, () => null);
-const linkPaths = nulls(8), dotPaths = nulls(12), speckPaths = nulls(16), smallPaths = nulls(16), haloPaths = nulls(16);
+const linkPaths = nulls(16), dotPaths = nulls(12), litDots = nulls(12), speckPaths = nulls(16), smallPaths = nulls(16), haloPaths = nulls(16);
+/// link size class and ambient dots drawn this frame, per cluster index (classes rebuilt when the
+/// store's cluster list is replaced)
+let famOf: Cluster[] | null = null, famLen = 0, famClass = new Uint8Array(0), famDots = new Uint16Array(0);
+/// the lit coin and its ancestors (1 = on the path), cleared at the end of every frame
+let onPath = new Uint8Array(0);
+/// hub strokes this frame: path, hub node, its class/dimmed key, rim radius and the summed inner length
+/// of its links (the fade spans part of their mean); hubSlot[node] = slot or -1, reset after the frame
+const hubPaths = nulls(HUB_SLOTS), hubNode = new Int32Array(HUB_SLOTS), hubKey = new Uint8Array(HUB_SLOTS), hubRa = new Float32Array(HUB_SLOTS), hubLen = new Float32Array(HUB_SLOTS), hubCnt = new Int32Array(HUB_SLOTS);
+let hubSlot = new Int16Array(0), hubN = 0;
+const pathList = new Int32Array(17);
+let pathN = 0;
 const beaconX = new Float32Array(BEACON_CAP), beaconY = new Float32Array(BEACON_CAP), beaconR = new Float32Array(BEACON_CAP), beaconDim = new Uint8Array(BEACON_CAP);
 let beaconN = 0;
 let supp = new Uint8Array(0);
@@ -240,91 +279,119 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
   }
 
   const hov = s.pinned >= 0 ? s.pinned : s.hover >= 0 ? s.hover : s.selected;
-  const dimming = hov >= 0;
+  // A drag shows the family as it is: nothing lit, nothing dimmed (the grabbed bubble keeps its ring).
+  // The store carries the dragged tree's hull and anchors along (store.translateDrag / measureDrag).
+  const dragging = st.dragging;
+  const dimming = hov >= 0 && !dragging;
   const hl = !!s.highlight;
   HOV = hov; SEL = s.selected; DIMMING = dimming; HL = hl;
   const clusters = st.clusters;
-  const hcRaw = s.hoverCluster >= 0 ? s.hoverCluster : hov >= 0 ? st.cluster[hov] : -1;
+  const hcRaw = dragging && st.dragCluster >= 0 ? st.dragCluster : s.hoverCluster >= 0 ? s.hoverCluster : hov >= 0 ? st.cluster[hov] : -1;
   const hc = hcRaw >= 0 && hcRaw < clusters.length ? hcRaw : -1;
+  // the lit coin and its ancestors up to the top of its family: their links are lit, their bubbles not dimmed
+  if (onPath.length < st.cap) onPath = new Uint8Array(st.cap);
+  pathN = 0;
+  if (dimming) { let c = hov; while (c >= 0 && c < n && pathN < pathList.length) { onPath[c] = 1; pathList[pathN++] = c; c = parent[c]; } }
 
-  // ---- tree hulls: one soft blob per big cluster, hugging where its members are (hull of the
-  // member centres stroked with a fat round-joined line, which pads it into a rounded shape). They
-  // fade out between k = 0.6 and 1.6: zoomed in, the bubbles themselves show the tree.
+  // ---- tree hulls: one soft blob per big cluster, hugging where its members are (hull of the member
+  // centres stroked with a fat round-joined line, which pads it into a rounded shape). They fade out
+  // between k = 0.6 and 1.6: zoomed in, the bubbles themselves show the tree. The active tree keeps the
+  // neutral tint (a lime blob behind 1 000 coins reads as a stain) with a faint lime rim.
   if (!s.focus) {
     const fadeK = Math.min(1, Math.max(0, (1.6 - k) / 1.0));
     ctx.lineJoin = "round"; ctx.lineCap = "round";
     if (fadeK > 0) {
       for (let ci = 0; ci < clusters.length; ci++) {
         const c = clusters[ci];
-        if (!c.big || c.hullN === 0) continue;
+        if (!c.big) continue;
         const hull = c.hull, hn = c.hullN;
+        if (hn === 0) continue;
         let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-        for (let q = 0; q < hn; q++) { const px = hull[q * 2] * k + tx, py = hull[q * 2 + 1] * k + ty; if (px < x0) x0 = px; if (py < y0) y0 = py; if (px > x1) x1 = px; if (py > y1) y1 = py; }
-        const pad = (c.maxR + 14) * k;
+        for (let p = 0; p < hn; p++) { const px = hull[p * 2] * k + tx, py = hull[p * 2 + 1] * k + ty; if (px < x0) x0 = px; if (py < y0) y0 = py; if (px > x1) x1 = px; if (py > y1) y1 = py; }
+        const pad = (Math.min(c.maxR, HULL_PAD_CAP) + HULL_PAD) * k;
         if (x1 + pad < 0 || y1 + pad < 0 || x0 - pad > w || y0 - pad > h) continue;
         const on = hc === ci, dimmed = dimming && !on;
-        const m = fadeK * (dimmed ? 0.5 : 1);
-        const tab = on ? LIME_F : HULL_F;
+        const mul = fadeK * (dimmed ? 0.5 : 1);
         ctx.beginPath();
         ctx.moveTo(hull[0] * k + tx, hull[1] * k + ty);
         if (hn === 1) ctx.lineTo(hull[0] * k + tx + 0.01, hull[1] * k + ty);
-        for (let q = 1; q < hn; q++) ctx.lineTo(hull[q * 2] * k + tx, hull[q * 2 + 1] * k + ty);
+        for (let p = 1; p < hn; p++) ctx.lineTo(hull[p * 2] * k + tx, hull[p * 2 + 1] * k + ty);
         ctx.closePath();
         ctx.lineWidth = pad * 2;
-        ctx.strokeStyle = fa(tab, (on ? 0.1 : 0.05) * m);
+        ctx.strokeStyle = fa(HULL_F, (on ? 0.06 : 0.05) * mul);
         ctx.stroke();
-        ctx.fillStyle = fa(tab, (on ? 0.06 : 0.04) * m);
+        ctx.fillStyle = fa(HULL_F, (on ? 0.045 : 0.04) * mul);
         ctx.fill();
         // a thin rim so the blob has an edge instead of fading into the grid
         ctx.lineWidth = pad * 2 + 2;
-        ctx.strokeStyle = fa(tab, (on ? 0.22 : 0.09) * m);
+        ctx.strokeStyle = fa(on ? LIME_F : HULL_F, (on ? 0.13 : 0.09) * mul);
         ctx.save(); ctx.globalCompositeOperation = "destination-over"; ctx.stroke(); ctx.restore();
       }
     }
-    // the active tree's boundary at any zoom (small trees have no hull)
+    // the active tree's boundary at any zoom (small trees have no hull); faint while its hull shows
     if (hc >= 0) {
-      const c = clusters[hc];
-      if (c.anchored && c.cr * k >= 6) { ctx.beginPath(); ctx.arc(c.ccx * k + tx, c.ccy * k + ty, c.cr * k, 0, Math.PI * 2); ctx.lineWidth = 1; ctx.strokeStyle = ca(LIME_A, 0.22); ctx.stroke(); }
+      const c = clusters[hc], cr = c.cr * k;
+      if (c.anchored && cr >= 6) {
+        ctx.beginPath(); ctx.arc(c.ccx * k + tx, c.ccy * k + ty, cr, 0, TAU);
+        ctx.lineWidth = 1; ctx.strokeStyle = ca(LIME_A, c.big ? 0.05 + 0.17 * (1 - fadeK) : 0.22); ctx.stroke();
+      }
     }
   }
 
-  // ---- links: one path per parent colour (dimmed ones apart), the hovered ones on top with a
-  // gradient; dots travel child → parent (buys flow upward), batched by colour and fade bucket, and
-  // only on pairs whose child traded in the last 30 min. A link into a speck is not drawn: at that
-  // size it is only noise, and it is what bounds the work when 20 k bubbles are on screen.
+  // ---- links: one path per (family size class, parent colour) and one per colour for the dimmed /
+  // filtered-out ones; the lit coin's links apart (litLinks). Dots travel child → parent (buys flow
+  // upward), batched by colour and fade bucket, only on pairs whose child traded in the last 30 min and
+  // at most DOTS_PER_FAMILY per family. A link into a speck is not drawn: at that size it is only noise,
+  // and it is what bounds the work when 20 k bubbles are on screen.
   ctx.lineCap = "round";
-  for (let q = 0; q < 8; q++) linkPaths[q] = null;
+  for (let q = 0; q < 16; q++) linkPaths[q] = null;
   for (let q = 0; q < 12; q++) dotPaths[q] = null;
-  let hotN = 0, visibleLinks = 0;
-  const { lsrc, ldst, lseed, m, lastTrade } = st;
+  if (famOf !== clusters || famLen !== clusters.length) {
+    famOf = clusters; famLen = clusters.length;
+    if (famClass.length < clusters.length) { famClass = new Uint8Array(clusters.length + 64); famDots = new Uint16Array(famClass.length); }
+    for (let ci = 0; ci < clusters.length; ci++) { const cnt = clusters[ci].members.length; famClass[ci] = cnt > HUGE_FAMILY ? 2 : cnt > BIG_FAMILY ? 1 : 0; }
+  }
+  const famN = clusters.length;
+  famDots.fill(0, 0, famN);
+  let visibleLinks = 0;
+  const { lsrc, ldst, lseed, m, lastTrade, cluster, childStart } = st;
+  if (hubSlot.length < st.cap) { hubSlot = new Int16Array(st.cap); hubSlot.fill(-1); }
+  hubN = 0;
   const speed = 0.00022; // cycles per ms; ~4.5 s to travel a link
   const wantDots = !s.static && !dimming;
   const wallNow = Date.now(), recentAfter = wallNow - DOT_RECENT_MS;
+  const minIn = k < 1 ? LINK_MIN_OUT : LINK_MIN_IN;
   for (let l = 0; l < m; l++) {
     const a = lsrc[l], b = ldst[l];
+    if (dimming && (a === hov || onPath[b] === 1)) continue; // lit: litLinks draws it
     const ga = growOf(born[a], now, STILL), gb = growOf(born[b], now, STILL);
     if (ga <= 0 || gb <= 0) continue;
     const rb = r[b] * k * gb;
-    const on = dimming && (a === hov || b === hov);
-    if (!on && rb < 1.5) continue;
+    if (rb < 1.5) continue;
     const ax = x[a] * k + tx, ay = y[a] * k + ty, bx = x[b] * k + tx, by = y[b] * k + ty;
     if ((ax < -40 && bx < -40) || (ay < -40 && by < -40) || (ax > w + 40 && bx > w + 40) || (ay > h + 40 && by > h + 40)) continue;
     const dx = bx - ax, dy = by - ay, len = Math.sqrt(dx * dx + dy * dy);
     if (len < 1) continue;
     const ra = r[a] * k * ga;
     const inner = len - ra - rb;
-    if (inner < 2) continue;
-    if (on) { if (hotN < HOT_CAP) s.hot[hotN++] = l; continue; }
+    const fc = cluster[a], cls = fc >= 0 && fc < famN ? famClass[fc] : 0;
+    if (inner < minIn[cls]) continue;
     const ux = dx / len, uy = dy / len;
     const x0 = ax + ux * ra, y0 = ay + uy * ra, x1 = bx - ux * rb, y1 = by - uy * rb;
     const ci = color[a];
-    const faint = hl && !(flags[a] & F_MATCH) && !(flags[b] & F_MATCH);
-    const pk = ci + (faint ? 4 : 0);
-    let p = linkPaths[pk]; if (!p) { p = new Path2D(); linkPaths[pk] = p; }
+    const faint = dimming || (hl && !(flags[a] & F_MATCH) && !(flags[b] & F_MATCH));
+    let p: Path2D | null = null;
+    if (childStart[a + 1] - childStart[a] > HUB_FAN) {
+      let sl = hubSlot[a];
+      if (sl < 0 && hubN < HUB_SLOTS) { sl = hubN++; hubSlot[a] = sl; hubNode[sl] = a; hubPaths[sl] = new Path2D(); hubKey[sl] = dimming || (hl && !(flags[a] & F_MATCH)) ? 4 : cls; hubRa[sl] = ra; hubLen[sl] = 0; hubCnt[sl] = 0; }
+      if (sl >= 0) { p = hubPaths[sl]; hubLen[sl] += inner; hubCnt[sl]++; }
+    }
+    if (!p) { const pk = faint ? 12 + ci : cls === 2 ? 8 : cls * 4 + ci; p = linkPaths[pk]; if (!p) { p = new Path2D(); linkPaths[pk] = p; } }
     p.moveTo(x0, y0); p.lineTo(x1, y1);
     visibleLinks++;
     if (!wantDots || faint || inner < 24 || visibleLinks > MAX_DOT_LINKS || lastTrade[b] < recentAfter) continue;
     const nDots = inner > 140 ? 3 : inner > 70 ? 2 : 1;
+    if (fc >= 0 && fc < famN) { if (famDots[fc] >= DOTS_PER_FAMILY) continue; famDots[fc] += nDots; }
     for (let q = 0; q < nDots; q++) {
       const prog = 1 - ((now * speed + lseed[l] + q / nDots) % 1); // 1 → 0 = child → parent
       const px = x0 + (x1 - x0) * prog, py = y0 + (y1 - y0) * prog;
@@ -332,33 +399,22 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
       const bucket = fade < 0.35 ? 0 : fade < 0.75 ? 1 : 2;
       const dk = ci * 3 + bucket;
       let dp = dotPaths[dk]; if (!dp) { dp = new Path2D(); dotPaths[dk] = dp; }
-      dp.moveTo(px + 1.6, py); dp.arc(px, py, 1.6, 0, Math.PI * 2);
+      dp.moveTo(px + 1.6, py); dp.arc(px, py, 1.6, 0, TAU);
     }
   }
-  ctx.lineWidth = 1;
-  for (let pk = 0; pk < 8; pk++) { const p = linkPaths[pk]; if (p) { ctx.strokeStyle = ca(COLOR_A[pk & 3], pk >= 4 || dimming ? 0.05 : 0.3); ctx.stroke(p); } }
+  for (let pk = 0; pk < 16; pk++) { const p = linkPaths[pk]; if (p) { ctx.lineWidth = pk < 12 ? LINK_W[pk >> 2] : LINK_DIM_W; ctx.strokeStyle = LINK_STYLE[pk]; ctx.stroke(p); } }
+  for (let sl = 0; sl < hubN; sl++) {
+    const a = hubNode[sl], key = hubKey[sl], cls = key === 4 ? 0 : key;
+    const hx = x[a] * k + tx, hy = y[a] * k + ty, ra = hubRa[sl];
+    const fade = Math.max(16, Math.min(140, 0.6 * hubLen[sl] / Math.max(1, hubCnt[sl])));
+    const stops = HUB_STOP[cls === 2 ? 4 : color[a]];
+    const g = ctx.createRadialGradient(hx, hy, ra, hx, hy, ra + fade);
+    g.addColorStop(0, stops[0]); g.addColorStop(1, stops[key === 4 ? 4 : 1 + cls]);
+    ctx.lineWidth = key === 4 ? LINK_DIM_W : LINK_W[cls]; ctx.strokeStyle = g; ctx.stroke(hubPaths[sl]!);
+    hubPaths[sl] = null; hubSlot[a] = -1;
+  }
   for (let dk = 0; dk < 12; dk++) { const p = dotPaths[dk]; if (p) { ctx.fillStyle = DOT_STYLE[dk]; ctx.fill(p); } }
-  for (let q = 0; q < hotN; q++) {
-    const l = s.hot[q], a = lsrc[l], b = ldst[l];
-    const ax = x[a] * k + tx, ay = y[a] * k + ty, bx = x[b] * k + tx, by = y[b] * k + ty;
-    const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy); const ux = dx / len, uy = dy / len;
-    const ra = r[a] * k * growOf(born[a], now, STILL), rb = r[b] * k * growOf(born[b], now, STILL);
-    const x0 = ax + ux * ra, y0 = ay + uy * ra, x1 = bx - ux * rb, y1 = by - uy * rb;
-    const grad = ctx.createLinearGradient(x0, y0, x1, y1);
-    grad.addColorStop(0, ca(COLOR_A[color[a]], 0.9)); grad.addColorStop(1, ca(COLOR_A[color[b]], 0.7));
-    ctx.strokeStyle = grad; ctx.lineWidth = 1.8;
-    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
-    if (s.static) continue;
-    const inner = len - ra - rb;
-    const nDots = Math.max(1, Math.min(4, Math.round(inner / 70)));
-    const tab = COLOR_A[color[a]];
-    for (let i = 0; i < nDots; i++) {
-      const prog = 1 - ((now * speed + lseed[l] + i / nDots) % 1);
-      const px = x0 + (x1 - x0) * prog, py = y0 + (y1 - y0) * prog;
-      ctx.fillStyle = ca(tab, 0.9 * Math.sin(prog * Math.PI));
-      ctx.beginPath(); ctx.arc(px, py, 2.2, 0, Math.PI * 2); ctx.fill();
-    }
-  }
+  if (dimming) litLinks(ctx, s, hov, speed);
 
   // ---- trade fx: ripples, flashes and comets under the bubbles
   s.perf.fx = drawFx(ctx, s.fx, st, s.sprites, k, tx, ty, w, h, now, s.static);
@@ -416,6 +472,8 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
     putLabel(ctx, s, i, false, false, special ? 1 : Math.min(1, Math.max(0, (srT - (LABEL_R - 3)) / 6)));
   }
   for (let q = 0; q < suppN; q++) supp[suppList[q]] = 0;
+  for (let q = 0; q < pathN; q++) onPath[pathList[q]] = 0;
+  pathN = 0;
   s.perf.labels = labelsN;
   s.perf.built = builds;
 
@@ -439,10 +497,91 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
   if (DEBUG_HOOKS) (globalThis as { __sporeRender?: Perf }).__sporeRender = s.perf;
 }
 
+/// The lit (hovered / selected) coin's links. Its children: one thin stroke in its colour whose alpha
+/// falls with their number (a hub with 1 000 children reads as a soft halo, not a starburst), with at
+/// most HOT_DOTS dots spread over them. Then its ancestor path up to the top of the family, the only
+/// lines drawn bright (≤ 16 gradients).
+function litLinks(ctx: CanvasRenderingContext2D, s: State, hov: number, speed: number) {
+  const st = s.store, { x, y, r, born, color, parent, childStart, childList, lseed } = st;
+  const k = K, tx = TX, ty = TY, now = NOW, w = W, h = H, sl = lseed.length || 1;
+  for (let q = 0; q < 12; q++) litDots[q] = null;
+  const dot = (ci: number, x0: number, y0: number, x1: number, y1: number, seed: number, d: number, nd: number) => {
+    const prog = 1 - ((now * speed + seed + d / nd) % 1); // 1 → 0 = child → parent
+    const fade = Math.sin(prog * Math.PI);
+    const key = ci * 3 + (fade < 0.35 ? 0 : fade < 0.75 ? 1 : 2);
+    const px = x0 + (x1 - x0) * prog, py = y0 + (y1 - y0) * prog;
+    let p = litDots[key]; if (!p) { p = new Path2D(); litDots[key] = p; }
+    p.moveTo(px + 2, py); p.arc(px, py, 2, 0, TAU);
+  };
+  const c0 = childStart[hov], c1 = childStart[hov + 1], cs = c1 - c0;
+  const gh = growOf(born[hov], now, STILL);
+  if (cs > 0 && gh > 0) {
+    const ax = x[hov] * k + tx, ay = y[hov] * k + ty, ra = r[hov] * k * gh, ci = color[hov];
+    const stride = Math.max(1, Math.ceil(cs / HOT_DOTS));
+    let path: Path2D | null = null, dots = 0, sum = 0, cnt = 0;
+    for (let q = c0; q < c1; q++) {
+      const b = childList[q], gb = growOf(born[b], now, STILL);
+      if (gb <= 0) continue;
+      const bx = x[b] * k + tx, by = y[b] * k + ty;
+      if ((ax < -40 && bx < -40) || (ay < -40 && by < -40) || (ax > w + 40 && bx > w + 40) || (ay > h + 40 && by > h + 40)) continue;
+      const dx = bx - ax, dy = by - ay, len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1) continue;
+      const rb = r[b] * k * gb, inner = len - ra - rb;
+      if (inner < 2) continue;
+      const ux = dx / len, uy = dy / len;
+      const x0 = ax + ux * ra, y0 = ay + uy * ra, x1 = bx - ux * rb, y1 = by - uy * rb;
+      if (!path) path = new Path2D();
+      path.moveTo(x0, y0); path.lineTo(x1, y1); sum += inner; cnt++;
+      if (s.static || inner < 24 || dots >= HOT_DOTS || (q - c0) % stride !== 0) continue;
+      const nd = inner > 140 && cs * 2 <= HOT_DOTS ? 2 : 1;
+      for (let d = 0; d < nd; d++) dot(ci, x0, y0, x1, y1, lseed[b % sl], d, nd);
+      dots += nd;
+    }
+    if (path) {
+      const a = cs <= 8 ? 0.6 : cs <= 40 ? 0.42 : cs <= 200 ? 0.26 : 0.18, col = ca(COLOR_A[ci], a);
+      ctx.lineWidth = cs <= 8 ? 1.3 : 1;
+      if (cs > HUB_FAN) {
+        // a hub: the spokes fade in over the first third of their mean length, so they do not knot on it
+        const g = ctx.createRadialGradient(ax, ay, ra, ax, ay, ra + Math.max(12, 0.35 * sum / Math.max(1, cnt)));
+        g.addColorStop(0, ca(COLOR_A[ci], 0)); g.addColorStop(1, col);
+        ctx.strokeStyle = g;
+      } else ctx.strokeStyle = col;
+      ctx.stroke(path);
+    }
+  }
+  // ancestor path: the coin → its parent → … → the top of its family
+  ctx.lineWidth = 1.6;
+  for (let q = 0; q < pathN; q++) {
+    const b = pathList[q], a = parent[b];
+    if (a < 0) continue;
+    const ga = growOf(born[a], now, STILL), gb = growOf(born[b], now, STILL);
+    if (ga <= 0 || gb <= 0) continue;
+    const ax = x[a] * k + tx, ay = y[a] * k + ty, bx = x[b] * k + tx, by = y[b] * k + ty;
+    if ((ax < -40 && bx < -40) || (ay < -40 && by < -40) || (ax > w + 40 && bx > w + 40) || (ay > h + 40 && by > h + 40)) continue;
+    const dx = bx - ax, dy = by - ay, len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 1) continue;
+    const ra = r[a] * k * ga, rb = r[b] * k * gb, inner = len - ra - rb;
+    if (inner < 2) continue;
+    const ux = dx / len, uy = dy / len;
+    const x0 = ax + ux * ra, y0 = ay + uy * ra, x1 = bx - ux * rb, y1 = by - uy * rb;
+    const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+    grad.addColorStop(0, ca(COLOR_A[color[a]], 0.85)); grad.addColorStop(1, ca(COLOR_A[color[b]], 0.6));
+    ctx.strokeStyle = grad;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    if (s.static || inner < 24) continue;
+    const nd = inner > 140 ? 2 : 1;
+    for (let d = 0; d < nd; d++) dot(color[a], x0, y0, x1, y1, lseed[b % sl], d, nd);
+  }
+  for (let dk = 0; dk < 12; dk++) { const p = litDots[dk]; if (p) { ctx.fillStyle = DOT_STYLE[dk]; ctx.fill(p); } }
+}
+
 function fillSpecks(ctx: CanvasRenderingContext2D) {
   if (curAlpha !== 1) { ctx.globalAlpha = 1; curAlpha = 1; }
   for (let key = 0; key < 16; key++) { const p = haloPaths[key]; if (p) { ctx.fillStyle = SMALL_HALO[key]; ctx.fill(p); haloPaths[key] = null; } }
-  ctx.lineWidth = 1.1;
+  // 1 px, not more: Skia strokes up to one device pixel wide on its hairline path, which costs a
+  // fraction of the general stroker in software raster. At 1.1 px the thousands of small rings took
+  // ~6 ms of canvas raster per frame on a 1 300-coin family at k 1.2 (21 → 14.5 ms with 1 px).
+  ctx.lineWidth = 1;
   for (let key = 0; key < 16; key++) { const p = smallPaths[key]; if (p) { ctx.fillStyle = SMALL_FILL[key]; ctx.fill(p); ctx.strokeStyle = SMALL_RING[key]; ctx.stroke(p); smallPaths[key] = null; } }
   for (let key = 0; key < 16; key++) { const p = speckPaths[key]; if (p) { ctx.fillStyle = SPECK_STYLE[key]; ctx.fill(p); speckPaths[key] = null; } }
 }
@@ -468,7 +607,7 @@ function bubblePass(ctx: CanvasRenderingContext2D, s: State, which: 0 | 1 | 2) {
     drawnN++;
     const on = i === hov;
     const isFocus = (fl & F_FOCUS) !== 0;
-    const hdim = DIMMING && !rel[i] && !on;
+    const hdim = DIMMING && !rel[i] && !on && !onPath[i];
     const ldim = which === 1;
     // pulse ring for a freshly spawned child
     if (pulse[i]) {
@@ -637,7 +776,7 @@ function putLabel(ctx: CanvasRenderingContext2D, s: State, i: number, big: boole
   const rects = s.labelRects;
   if (!force && overlaps(rects, x0, y0, x1, y1)) return false;
   reserve(rects, x0, y0, x1, y1); labelsN++;
-  const dim = DIMMING && !st.rel[i] && i !== HOV;
+  const dim = DIMMING && !st.rel[i] && i !== HOV && !onPath[i];
   const a = alpha * (dim ? 0.3 : 1);
   if (a !== 1) ctx.globalAlpha = a;
   ctx.drawImage(sp, Math.round(lx), Math.round(ly));

@@ -24,13 +24,22 @@
 //   moving node centred after landing; any user wheel/drag/pinch cancels it. A cold open starts at the
 //   fit of the initial placement, so the first frame is never the k = 1 view of a 16 k-node forest.
 // - Interaction: a bubble ≥ 3 px on screen is hovered/clicked as a bubble; anything smaller hands the
-//   pointer to its cluster (hover = tree tooltip, click = fly to the tree and select its root).
+//   pointer to its cluster or its title (hover = tree tooltip, click = fly to the tree and select its root).
+// - Drag (rigid subtree, like Bubblemaps): pressing a bubble and moving past CLICK_PX drags the bubble with
+//   every descendant (a root, or a tree's title / hull at overview, drags the whole tree; a touch grabs a
+//   tree by its title only, so a finger on a hull still pans). The moving set is collected once
+//   (store.beginDrag); each pointer move shifts it on this thread, so it is drawn at once with the tree's
+//   hull and anchors, and posts one {dx, dy} to the worker, which keeps the nodes pinned there without
+//   reheating anything. On release a local relaxation eases only that tree (layout.worker.ts); the other
+//   trees do not move. The renderer reads store.dragging / store.dragSet. Below CLICK_PX it is a click.
 // - Live: `live` subscribes to SSE trades and pushes ripples/comets into map/fx.ts (fixed slot ring,
 //   only while the map is visible); `heat` (the /api/map/heat sidecar) seeds each node's last trade
 //   and hourly count; `highlight` writes a match bit per node that dims the rest without moving it.
-// - Data changes are diffs: new nodes are placed next to their parent and relaxed with a low alpha,
-//   changed values tween radius, and the simulation is never restarted. Cached positions (IndexedDB)
-//   make a warm open paint settled bubbles on the first frame.
+// - Data changes are diffs: new nodes are placed next to their parent, changed values tween radius,
+//   and on a settled layout both relax with their neighbourhood only (the worker pins every other
+//   bubble meanwhile), so a live insert or value tick never moves the other trees; only a size-mode
+//   change relaxes everything. Cached positions (IndexedDB) make a warm open paint settled bubbles on
+//   the first frame.
 // - Images: lib/map/images.ts loads lazily by visibility and zoom through /api/img, ≤ 8 in flight,
 //   downsampled to 64–256 px thumbnails under a pixel budget; a bubble shows its letter until the logo
 //   arrives and swaps without a flicker.
@@ -117,6 +126,12 @@ const reduced = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-
 const GOLDEN = 2.399963;
 /// Below this on-screen radius a bubble hands the pointer to its cluster (and never starts a drag).
 const MIN_HIT_PX = 3;
+/// A press that moves less than this (screen px) is a click; past it, the grabbed subtree is dragged.
+const CLICK_PX = 4;
+/// Start alpha of the local relaxation after a drop (layout.worker.ts): a subtree pulled away from its
+/// parent eases most of the way back toward it, keeping its shape; a whole tree only slides off what it
+/// was dropped on (collisions do not scale with alpha).
+const RELAX_SUBTREE = 0.1, RELAX_WHOLE = 0.04;
 const CAMERA_HZ_MS = 250;
 const pct = (arr: Float32Array, n: number, p: number) => { if (!n) return 0; const a = Array.from(arr.subarray(0, Math.min(n, arr.length))).sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(a.length * p))]; };
 const stat = (arr: Float32Array, n: number) => { const len = Math.min(n, arr.length); let sum = 0, max = 0; for (let i = 0; i < len; i++) { sum += arr[i]; if (arr[i] > max) max = arr[i]; } return { n, avg: len ? sum / len : 0, p95: pct(arr, n, 0.95), max }; };
@@ -161,15 +176,48 @@ const markSaved = (sv: SavedPos, i: number, mint: string, x: number, y: number) 
 
 /// Bubble under a screen point that is big enough to be a bubble target, or -1.
 const grab = (s: State, x: number, y: number) => { const i = hitTest(s, x, y); return i >= 0 && screenR(s, i) >= MIN_HIT_PX ? i : -1; };
-/// What the pointer is over: a bubble ≥ 3 px, else its cluster (overview; not on the coin page), else a
-/// tiny bubble, else nothing. `i` is a node index, `c` a cluster index; at most one is ≥ 0.
+/// Cluster whose overview title (as drawn last frame) is under a screen point, or -1.
+function titleAt(s: State, x: number, y: number): number {
+  const p = s.perf, cl = s.store.clusters, t = s.t;
+  const n = Math.min(p.titles ?? 0, p.titleIdx?.length ?? 0);
+  for (let q = 0; q < n; q++) {
+    const c = cl[p.titleIdx[q]];
+    if (!c || !c.anchored) continue;
+    const w = Math.max(c.tsp?.width ?? 0, c.tspA?.width ?? 0) || c.tspW || 120;
+    const ax = c.ccx * t.k + t.x, ay = c.minY * t.k + t.y - 4;
+    if (x >= ax - w / 2 && x <= ax + w / 2 && y >= ay - 22 && y <= ay + 2) return p.titleIdx[q];
+  }
+  return -1;
+}
+/// What the pointer is over: a bubble ≥ 3 px, else a tree's title or the tree itself (overview; not on
+/// the coin page), else a tiny bubble, else nothing. `i` is a node index, `c` a cluster index; at most one is ≥ 0.
 function pointerTarget(s: State, x: number, y: number): { i: number; c: number } {
   const i = hitTest(s, x, y);
   if (i >= 0 && screenR(s, i) >= MIN_HIT_PX) return { i, c: -1 };
-  const c = s.focus ? -1 : clusterAt(s, x, y);
-  if (c >= 0) return { i: -1, c };
+  if (!s.focus) { const tc = titleAt(s, x, y), c = tc >= 0 ? tc : clusterAt(s, x, y); if (c >= 0) return { i: -1, c }; }
   return { i, c: -1 };
 }
+/// What a press grabs: a bubble ≥ 3 px (its subtree moves), else at overview a tree's title or, for a
+/// mouse, its hull (the whole tree moves, by its root); null = the press pans the map.
+function pressTarget(s: State, x: number, y: number, touch: boolean): { i: number; whole: boolean } | null {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  const i = grab(s, x, y);
+  if (i >= 0) return { i, whole: false };
+  if (s.focus) return null;
+  let c = titleAt(s, x, y);
+  if (c < 0 && !touch) c = clusterAt(s, x, y);
+  const root = c >= 0 ? s.store.clusters[c]?.root ?? -1 : -1;
+  return root >= 0 && root < s.store.n ? { i: root, whole: true } : null;
+}
+/// The screen point of a mouse or touch event relative to the canvas (the touch that changed).
+function eventPoint(ev: Event, cv: HTMLCanvasElement): [number, number] {
+  const te = ev as TouchEvent;
+  const t = te.changedTouches?.[0] ?? te.touches?.[0];
+  return t ? pointer(t, cv) : pointer(ev, cv);
+}
+/// A press in progress: the node it grabbed, whole-tree flag, press point (screen), whether it became a
+/// drag, and the grab offset (world units, pointer minus node) once it did.
+type Grab = { i: number; whole: boolean; x: number; y: number; active: boolean; ox: number; oy: number };
 
 export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, height, mode: modeProp = "locked", onModeChange, ref, className = "", inset, fresh, onLayout, highlight = null, live = false, heat = null, hideLegend = false, onCamera }: Props) {
   const nav = useNavigate();
@@ -179,6 +227,8 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
   const [mode, setMode] = useState<SizeMode>(modeProp);
   const [hover, setHover] = useState<number>(-1);
   const [hoverCluster, setHoverCluster] = useState<number>(-1);
+  /// A drag is in progress (hides the tooltips; the renderer reads store.dragging)
+  const [dragging, setDragging] = useState(false);
   useEffect(() => setMode(modeProp), [modeProp]);
 
   // Everything the render loop touches lives in refs: React re-renders only for the tooltip and the
@@ -188,6 +238,10 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
   st.current.focus = focus; st.current.inset = inset; st.current.mode = mode;
   st.current.onSelect = onSelect ? (i) => onSelect(i >= 0 ? st.current.store.data[i] : null) : undefined;
   const worker = useRef<Worker | null>(null);
+  /// After a drop: the nodes that moved and the drag's seq, until the worker's ticks acknowledge it (a
+  /// tick posted before the worker saw the last moves must not pull them back for a frame).
+  const afterDrag = useRef<{ ids: Int32Array; seq: number } | null>(null);
+  const dragSeq = useRef(0);
   const workerInfo = useRef<{ ticks: number; tickMs: number; frames: number; n: number; alpha: number; settled: boolean; at: number } | null>(null);
   const scale = useRef<Scale | null>(null);
   const layoutSavedAt = useRef(0);
@@ -229,7 +283,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     w.onerror = (e) => console.error("map layout worker error", e.message, e.filename, e.lineno);
     w.onmessageerror = () => console.error("map layout worker: message could not be deserialised");
     let frames = 0;
-    w.onmessage = (ev: MessageEvent<{ t: string; x: Float32Array; y: Float32Array; n: number; alpha: number; settled: boolean; ticks: number; tickMs: number }>) => {
+    w.onmessage = (ev: MessageEvent<{ t: string; x: Float32Array; y: Float32Array; n: number; alpha: number; settled: boolean; ticks: number; tickMs: number; ack?: number }>) => {
       const m = ev.data;
       if (m.t !== "tick") return;
       workerInfo.current = { ticks: m.ticks, tickMs: m.tickMs, frames: frames + 1, n: m.n, alpha: m.alpha, settled: m.settled, at: performance.now() };
@@ -239,6 +293,12 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       if (store.settled) { store.px.set(store.x.subarray(0, n)); store.py.set(store.y.subarray(0, n)); }
       else { store.px.set(store.nx.subarray(0, n)); store.py.set(store.ny.subarray(0, n)); }
       store.nx.set(m.x.subarray(0, n)); store.ny.set(m.y.subarray(0, n));
+      // the dragged subtree is ahead of the worker (its moves may still be in flight): this thread's
+      // positions win while the drag lasts, and after the drop until the worker acknowledges it
+      const ad = afterDrag.current;
+      if (ad && (m.ack ?? 0) >= ad.seq) afterDrag.current = null;
+      const keep = store.dragging ? store.dragIds : afterDrag.current?.ids;
+      if (keep) { const { x, y, px, py, nx, ny } = store; for (let q = 0; q < keep.length; q++) { const i = keep[q]; if (i < n) { px[i] = nx[i] = x[i]; py[i] = ny[i] = y[i]; } } }
       const dt = now - store.tickAt;
       store.tickDt = store.tickAt ? Math.min(120, Math.max(8, store.tickDt * 0.6 + dt * 0.4)) : 40;
       store.tickAt = now;
@@ -308,7 +368,9 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       for (let i = 0; i < store.n; i++) { const d = store.data[i]; if (keep.has(d.mint) && store.settled) { d.x = store.nx[i]; d.y = store.ny[i]; } }
       Object.assign(store, new MapStore());
       // node indices now mean other coins: drop the effects in flight and every index-keyed selection
+      // (a drag in progress ends with the old store: its moves no longer apply)
       clearFx(s.fx);
+      afterDrag.current = null;
       cancelFlight(s);
       scale.current = { ...scale.current!, count: nodes.length };
       s.hover = -1; s.pinned = -1; s.selected = -1; s.hoverCluster = -1; setHover(-1); setHoverCluster(-1);
@@ -392,16 +454,24 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
         else if (removed) { store.settled = true; postLayout(s, w, 0, "init", 0.12); }
         else { store.settled = false; store.tickAt = 0; postLayout(s, w, oldN, "add", Math.min(0.25, 0.06 + added.length * 0.002)); }
       }
+      // a coin that arrived under a node being dragged travels with it (it was placed next to its
+      // parent's current spot; left behind, it would be pulled across the map after the drop)
+      if (store.dragging && !cold && !removed) {
+        const join = added.filter((i) => store.parent[i] >= 0 && store.dragSet[store.parent[i]] === 1);
+        const ids = join.length ? store.joinDrag(join) : null;
+        if (w && ids && ids.length) w.postMessage({ t: "dragadd", ids }, [ids.buffer]);
+      }
       if (cold) {
         store.refreshHulls();
         // Start where the auto-fit is heading: the first frame is the fit of the initial placement,
         // never the k = 1 view (which drew giant hull rings for up to a second on a cold open).
         if (!s.follow && !s.flight) { const t0 = fitFor(s, 36); if (t0) { s.t = t0; syncZoom(); } }
         s.autoFit = !s.follow && !s.flight;
-      }
+      } else store.refreshHulls(); // the rebuild reset every hull: measure now, not on a later worker tick (all hulls blinked; a drag, which holds the worker back, lost them)
     } else if (parentChanged) {
       store.rebuildClusters(false, aspect);
       store.rebuildOrder();
+      store.refreshHulls();
     }
     if (radiiChanged) {
       s.tweenUntil = now + TWEEN_MS + 30;
@@ -414,7 +484,8 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
         // sub-pixel one needs none: the worker just learns the new collision radii.
         const alpha = rescale ? 0.3 : maxD > 1.5 ? 0.02 : 0;
         if (alpha > 0) { store.settled = false; store.tickAt = 0; }
-        w.postMessage({ t: "radius", idx, r, alpha }, [idx.buffer, r.buffer]);
+        // a live tick relaxes only the changed bubbles' neighbourhood (the worker pins the rest)
+        w.postMessage({ t: "radius", idx, r, alpha, global: rescale }, [idx.buffer, r.buffer]);
       }
       if (rescale) { for (const c of store.clusters) { let mx = 0; for (const i of c.members) if (store.rT[i] > mx) mx = store.rT[i]; c.maxR = mx; } }
     }
@@ -494,12 +565,24 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     resize();
     const ro = new ResizeObserver(() => { const w = s.w, h = s.h; resize(); if (w && h) { s.t = zoomIdentity.translate(s.t.x + (s.w - w) / 2, s.t.y + (s.h - h) / 2).scale(s.t.k); syncZoom(); } });
     ro.observe(el);
-    const cursor = () => { cv.style.cursor = s.hover >= 0 || s.hoverCluster >= 0 ? "pointer" : "grab"; };
+    const cursor = () => { cv.style.cursor = s.store.dragging ? "grabbing" : s.hover >= 0 || s.hoverCluster >= 0 ? "pointer" : "grab"; };
     const setHov = (i: number) => { if (i !== s.hover) { s.store.setRelated(s.hover, i); s.hover = i; setHover(i); } };
     const setHovCluster = (c: number) => { if (c !== s.hoverCluster) { s.hoverCluster = c; setHoverCluster(c); } };
 
+    // One press at a time: `press` is the current one (a second finger neither drags nor pinches meanwhile).
+    let press: Grab | null = null;
+    // d3-zoom pans and pinches only where a press grabs nothing (the two filters are complements)
     const z = zoom<HTMLCanvasElement, unknown>().scaleExtent([0.05, 6])
-      .filter((ev: Event & { button?: number; ctrlKey?: boolean }) => { if (ev.type === "wheel") return true; if (ev.type === "mousedown" || ev.type === "touchstart") { const [x, y] = pointer(ev, cv); return !ev.button && grab(s, x, y) < 0; } return !ev.button; })
+      .filter((ev: Event & { button?: number; ctrlKey?: boolean }) => {
+        if (ev.type === "wheel") return true;
+        if (ev.type === "mousedown" || ev.type === "touchstart") {
+          if (ev.button || press) return false;
+          if (ev.type === "touchstart" && (ev as TouchEvent).touches.length > 1) return true; // pinch
+          const [x, y] = eventPoint(ev, cv);
+          return !pressTarget(s, x, y, ev.type === "touchstart");
+        }
+        return !ev.button;
+      })
       .on("zoom", (ev: D3ZoomEvent<HTMLCanvasElement, unknown>) => {
         s.t = ev.transform;
         // a user gesture (wheel, pinch, pan) takes the camera and tells the renderer to economise sprites
@@ -510,11 +593,62 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     const sel = select(cv);
     // a cold open may already have placed the camera at the fit (data effect): keep that view
     sel.call(z).call(z.transform, s.t).on("dblclick.zoom", null);
-    const dg = drag<HTMLCanvasElement, unknown, { i: number; x: number; y: number }>()
-      .subject((ev: D3DragEvent<HTMLCanvasElement, unknown, unknown>) => { const i = grab(s, ev.x, ev.y); if (i < 0) return null as never; return { i, x: s.store.x[i] * s.t.k + s.t.x, y: s.store.y[i] * s.t.k + s.t.y }; })
-      .on("start", (ev) => { const i = ev.subject.i; cancelFlight(s); el.classList.add("dragging"); const [wx, wy] = s.t.invert([ev.x, ev.y]); worker.current?.postMessage({ t: "drag", i, x: wx, y: wy, phase: "start" }); })
-      .on("drag", (ev) => { const i = ev.subject.i; const [wx, wy] = s.t.invert([ev.x, ev.y]); const st = s.store; st.x[i] = st.px[i] = st.nx[i] = wx; st.y[i] = st.py[i] = st.ny[i] = wy; worker.current?.postMessage({ t: "drag", i, x: wx, y: wy, phase: "move" }); })
-      .on("end", (ev) => { const i = ev.subject.i; el.classList.remove("dragging"); const st = s.store; worker.current?.postMessage({ t: "drag", i, x: st.nx[i], y: st.ny[i], phase: "end" }); });
+    // A press becomes a drag only past CLICK_PX (below it the click handler selects or opens). The grabbed
+    // set then moves rigidly: the grabbed node stays under the pointer (offset kept, any zoom), the rest
+    // keeps its offsets to it.
+    const begin = (g: Grab): boolean => {
+      const st = s.store, w = worker.current;
+      if (g.i < 0 || g.i >= st.n) return false;
+      cancelFlight(s);
+      const [wx, wy] = s.t.invert([g.x, g.y]);
+      g.ox = wx - st.x[g.i]; g.oy = wy - st.y[g.i];
+      const ids = st.beginDrag(g.i, g.whole);
+      if (w) {
+        // the rest of the tree may make room for a dropped subtree; a whole tree has no rest
+        const c = st.dragCluster >= 0 && !st.dragWhole ? st.clusters[st.dragCluster] : undefined;
+        const sendIds = ids.slice(), tree = c ? Int32Array.from(c.members) : new Int32Array(0);
+        w.postMessage({ t: "dragstart", ids: sendIds, root: g.i, whole: st.dragWhole, tree }, [sendIds.buffer, tree.buffer]);
+      }
+      g.active = true;
+      el.classList.add("dragging"); cursor(); setDragging(true);
+      return true;
+    };
+    const finish = () => {
+      const st = s.store;
+      el.classList.remove("dragging"); setDragging(false);
+      if (!st.dragging) { cursor(); return; } // the store was rebuilt under the drag: nothing of it is left
+      const ids = st.dragIds, whole = st.dragWhole;
+      st.endDrag();
+      const seq = ++dragSeq.current;
+      afterDrag.current = { ids, seq };
+      st.tickAt = 0; // the relaxation's first tick interpolates from here, not from an old tick interval
+      worker.current?.postMessage({ t: "dragend", relax: whole ? RELAX_WHOLE : RELAX_SUBTREE, seq });
+      cursor();
+    };
+    const dg = drag<HTMLCanvasElement, unknown, Grab>()
+      .clickDistance(CLICK_PX)
+      .subject((ev: D3DragEvent<HTMLCanvasElement, unknown, unknown>) => {
+        if (press) return null as never;
+        const touch = !!(ev.sourceEvent as Event | undefined)?.type?.startsWith("touch");
+        const t = pressTarget(s, ev.x, ev.y, touch);
+        if (!t) return null as never;
+        // subject x/y = the press point, so every drag event's x/y is the pointer itself
+        return { i: t.i, whole: t.whole, x: ev.x, y: ev.y, active: false, ox: 0, oy: 0 };
+      })
+      .on("start", (ev) => { press = ev.subject; })
+      .on("drag", (ev) => {
+        const g = ev.subject;
+        if (g !== press) return;
+        if (!g.active) { const dx = ev.x - g.x, dy = ev.y - g.y; if (dx * dx + dy * dy <= CLICK_PX * CLICK_PX || !begin(g)) return; }
+        const st = s.store;
+        if (!st.dragging || st.dragRoot !== g.i) return; // the store was rebuilt under the drag
+        const [wx, wy] = s.t.invert([ev.x, ev.y]);
+        const dx = wx - g.ox - st.x[g.i], dy = wy - g.oy - st.y[g.i];
+        if (!(Math.abs(dx) + Math.abs(dy) > 1e-6)) return;
+        st.translateDrag(dx, dy);
+        worker.current?.postMessage({ t: "translate", dx, dy });
+      })
+      .on("end", (ev) => { const g = ev.subject; if (g !== press) return; press = null; if (g.active) finish(); });
     sel.call(dg);
 
     const move = (ev: MouseEvent) => {
@@ -535,7 +669,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     };
     const key = (ev: KeyboardEvent) => { if (ev.key === "Escape") { s.pinned = -1; setHov(-1); setHovCluster(-1); if (s.onSelect && s.selected >= 0) s.onSelect(-1); } };
     cv.addEventListener("mousemove", move); cv.addEventListener("mouseleave", leave); cv.addEventListener("click", click); el.addEventListener("keydown", key);
-    return () => { ro.disconnect(); sel.on(".zoom", null).on(".drag", null); cv.removeEventListener("mousemove", move); cv.removeEventListener("mouseleave", leave); cv.removeEventListener("click", click); el.removeEventListener("keydown", key); };
+    return () => { if (press?.active) finish(); press = null; ro.disconnect(); sel.on(".zoom", null).on(".drag", null); cv.removeEventListener("mousemove", move); cv.removeEventListener("mouseleave", leave); cv.removeEventListener("click", click); el.removeEventListener("keydown", key); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -625,7 +759,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       pick: (x: number, y: number) => { const [cx, cy] = page(x, y); const { i, c } = pointerTarget(s, cx, cy); return { node: i >= 0 ? s.store.ids[i] : null, cluster: c >= 0 ? rootMintOf(c) : null }; },
       /// side of the logo thumbnail a node currently draws (0 = none yet)
       logo: (mint: string) => { const i = s.store.idx.get(mint); if (i === undefined) return 0; const img = imageFor(s.store.data[i].image); return img ? img.width : 0; },
-      clusters: (n = 10) => s.store.clusters.slice(0, n).map((c) => ({ root: c.root >= 0 && c.root < s.store.n ? s.store.ids[c.root] : c.id, count: c.members.length, title: c.title, cx: c.ccx, cy: c.ccy, cr: c.cr })),
+      clusters: (n = 10) => s.store.clusters.slice(0, n).map((c) => ({ root: c.root >= 0 && c.root < s.store.n ? s.store.ids[c.root] : c.id, count: c.members.length, title: c.title, cx: c.ccx, cy: c.ccy, cr: c.cr, hullN: c.hullN })),
       members: (rootMint: string) => { const ci = s.store.clusterOf.get(rootMint); return ci === undefined ? [] : s.store.clusters[ci].members.map((i) => s.store.ids[i]); },
       testHighlight: (kind: "ours" | "min1k" | null) => {
         const store = s.store, f = store.flags;
@@ -638,6 +772,8 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       },
       children: (mint: string) => { const i = s.store.idx.get(mint); if (i === undefined) return []; const out: string[] = []; for (let k = s.store.childStart[i]; k < s.store.childStart[i + 1]; k++) out.push(s.store.ids[s.store.childList[k]]); return out; },
       selected: () => (s.selected >= 0 ? s.store.ids[s.selected] : null),
+      /// the drag in progress: grabbed node, its tree's root, moving nodes, whole-tree flag (null = none)
+      drag: () => { const st = s.store; if (!st.dragging) return null; const c = st.clusters[st.dragCluster]; return { node: st.ids[st.dragRoot], root: c ? rootMintOf(st.dragCluster) : null, n: st.dragIds.length, whole: st.dragWhole }; },
     };
     (window as unknown as { __sporeMap?: unknown }).__sporeMap = dbg;
     return () => { if ((window as unknown as { __sporeMap?: unknown }).__sporeMap === dbg) delete (window as unknown as { __sporeMap?: unknown }).__sporeMap; };
@@ -654,6 +790,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       s.raf = 0;
       if (!running) return;
       const t0 = performance.now();
+      s.store.measureDrag(); // a subtree drag reshaped its tree: anchors + hull from the drawn positions
       draw(ctx, s, tipEl.current, t0);
       const dt = performance.now() - t0;
       const p = s.perf; p.frames++; if (dt > p.max) p.max = dt;
@@ -679,12 +816,12 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
   const parentOf = hov?.parentMint ? store.data[store.idx.get(hov.parentMint) ?? -1] ?? null : null;
   const hasAnc = useMemo(() => (focus ? nodes.some((n) => { const f = nodes.find((x) => x.mint === focus); return f && n.depth < f.depth; }) : false), [nodes, focus]);
   const hasOurs = useMemo(() => nodes.some((n) => n.ours), [nodes]);
-  const showTip = !!hov && (!onSelect || hover !== st.current.selected);
+  const showTip = !!hov && !dragging && (!onSelect || hover !== st.current.selected);
   const hovColor = hov ? COLORS[colorIdx(hov.depth)] : COLORS[0];
   const hovT1h = hov ? store.t1h[hover] : 0;
   const hovLast = hov ? store.lastTrade[hover] : 0;
   // the tree under the pointer (overview): its root, size and three largest children
-  const cl = !showTip && hoverCluster >= 0 && hoverCluster < store.clusters.length ? store.clusters[hoverCluster] : null;
+  const cl = !showTip && !dragging && hoverCluster >= 0 && hoverCluster < store.clusters.length ? store.clusters[hoverCluster] : null;
   const clRoot = cl && cl.root >= 0 && cl.root < store.n ? store.data[cl.root] : null;
   const clTop = useMemo(() => {
     if (!cl || cl.root < 0 || cl.root >= store.n) return [];

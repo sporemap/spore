@@ -3,9 +3,12 @@
 // links, child adjacency, root clusters with their hulls and title anchors) rebuilt only when the node
 // set changes. Positions come from the worker as `nx/ny`; `px/py` is the previous frame and `x/y` the
 // interpolated position the frame draws, so a 50 ms worker tick still moves bubbles smoothly at 60 fps.
+// A drag moves a whole subtree rigidly: `beginDrag` collects it once (CSR walk) into `dragIds` and marks
+// `dragSet`, `translateDrag` shifts x/px/nx alike (so the interpolation cannot pull it back) and carries
+// the tree's centre, anchors and hull along, and `endDrag` clears the marks.
 // Per-node render caches (last sprite, label bitmap, letter) live here too, so a store rebuild drops
 // them together with the indices they belong to.
-import { packSiblings, polygonHull } from "d3";
+import { packSiblings } from "d3";
 import { count as fmtCount } from "../../lib/format";
 import type { BubbleNode, SizeMode } from "../../lib/map/types";
 
@@ -52,6 +55,34 @@ export const labelOf = (symbol: string | null, name: string | null, mint: string
 /// EMA weight for title anchors while the layout settles (titles glide instead of jittering).
 const ANCHOR_EMA = 0.35;
 
+// Convex hull scratch (monotone chain over member indices sorted by x): grown once, then reused, so a
+// hull refresh allocates nothing. The comparator reads positions through these module-level refs.
+let HX: Float32Array = new Float32Array(0), HY: Float32Array = new Float32Array(0);
+let hullOrd = new Int32Array(0), hullStack = new Int32Array(0);
+const byX = (a: number, b: number) => HX[a] - HX[b] || HY[a] - HY[b];
+const cross = (o: number, a: number, b: number) => (HX[a] - HX[o]) * (HY[b] - HY[o]) - (HY[a] - HY[o]) * (HX[b] - HX[o]);
+/// Convex hull of the members' centres (members without a position are skipped) into out as x,y pairs;
+/// returns the number of hull points. Fewer than three points are copied as they are.
+function convexHull(mem: number[], xs: Float32Array, ys: Float32Array, out: Float32Array): number {
+  if (hullOrd.length < mem.length) { hullOrd = new Int32Array(mem.length + 256); hullStack = new Int32Array(mem.length * 2 + 512); }
+  let n = 0;
+  for (let q = 0; q < mem.length; q++) { const i = mem[q], x = xs[i], y = ys[i]; if (x === x && y === y) hullOrd[n++] = i; }
+  HX = xs; HY = ys;
+  const ord = hullOrd.subarray(0, n);
+  ord.sort(byX);
+  const st = hullStack;
+  let h = 0;
+  if (n < 3) { for (let q = 0; q < n; q++) st[h++] = ord[q]; }
+  else {
+    for (let q = 0; q < n; q++) { const i = ord[q]; while (h >= 2 && cross(st[h - 2], st[h - 1], i) <= 0) h--; st[h++] = i; }
+    const lo = h + 1;
+    for (let q = n - 2; q >= 0; q--) { const i = ord[q]; while (h >= lo && cross(st[h - 2], st[h - 1], i) <= 0) h--; st[h++] = i; }
+    h--; // the last point repeats the first
+  }
+  for (let q = 0; q < h; q++) { out[q * 2] = xs[st[q]]; out[q * 2 + 1] = ys[st[q]]; }
+  return h;
+}
+
 export class MapStore {
   n = 0; cap = 0;
   ids: string[] = []; data: BubbleNode[] = []; idx = new Map<string, number>();
@@ -79,6 +110,14 @@ export class MapStore {
   sprRing = new Int32Array(SPR_RING).fill(-1); sprRingW = 0; labelRing = new Int32Array(LABEL_RING).fill(-1); labelRingW = 0;
   // worker frame interpolation
   tickAt = 0; tickDt = 40; settled = true; alpha = 0; tweening = false; maxR = 1;
+  // ---- drag (BubbleMap writes it, draw.ts reads it)
+  /// A drag is moving a subtree right now; dragSet[i] = 1 for every node that moves with it.
+  dragging = false; dragSet = new Uint8Array(0);
+  /// The dragged node (its subtree moves), its tree (cluster index), whether the whole tree moves
+  /// (a root or a cluster was grabbed), and the moving node indices.
+  dragRoot = -1; dragCluster = -1; dragWhole = false; dragIds = new Int32Array(0);
+  /// A subtree drag reshaped its tree: the tree's anchors and hull are re-measured before the next frame.
+  dragDirty = false;
 
   grow(min: number) {
     if (min <= this.cap) return;
@@ -89,7 +128,7 @@ export class MapStore {
     this.r = f32(this.r); this.rT = f32(this.rT); this.r0 = f32(this.r0); this.rt0 = f64(this.rt0); this.born = f64(this.born); this.pulse = f64(this.pulse);
     this.lastTrade = f64(this.lastTrade);
     const u8 = (a: Uint8Array) => { const b = new Uint8Array(cap); b.set(a); return b; };
-    this.depth = u8(this.depth); this.color = u8(this.color); this.flags = u8(this.flags); this.rel = u8(this.rel);
+    this.depth = u8(this.depth); this.color = u8(this.color); this.flags = u8(this.flags); this.rel = u8(this.rel); this.dragSet = u8(this.dragSet);
     this.sprBits = u8(this.sprBits); this.labelVariant = u8(this.labelVariant);
     const u16 = (a: Uint16Array) => { const b = new Uint16Array(cap); b.set(a); return b; };
     this.gen = u16(this.gen); this.t1h = u16(this.t1h); this.sprRi = u16(this.sprRi); this.sprGen = u16(this.sprGen); this.letter = u16(this.letter);
@@ -156,15 +195,17 @@ export class MapStore {
     this.childStart = start; this.childList = list;
   }
 
-  /// Draw order: small first so big bubbles and their labels sit on top. Rebuilt when radii settle.
+  /// Draw order: small first so big bubbles and their labels sit on top; among equal radii the higher
+  /// generation first, so a family's top is drawn over (and hit before) same-size children piled on it
+  /// (a top with nothing locked sits at the floor radius in the middle of its children). Rebuilt when radii settle.
   rebuildOrder() {
     const n = this.n;
     if (this.order.length !== n) this.order = new Int32Array(n);
     const o = this.order;
     for (let i = 0; i < n; i++) o[i] = i;
-    const rT = this.rT;
+    const rT = this.rT, depth = this.depth;
     // a typed array sort with a comparator is fine at 20k (~6 ms) and happens on data changes only
-    o.sort((a, b) => rT[a] - rT[b]);
+    o.sort((a, b) => rT[a] - rT[b] || depth[b] - depth[a]);
     let mx = 1; for (let i = 0; i < n; i++) if (rT[i] > mx) mx = rT[i];
     this.maxR = mx;
   }
@@ -209,6 +250,8 @@ export class MapStore {
     this.clusters = next;
     this.clusterOf = new Map(next.map((c, i) => [c.id, i]));
     for (const c of next) { const ci = this.clusterOf.get(c.id)!; for (const i of c.members) this.cluster[i] = ci; }
+    // clusters were re-sorted: a drag in progress follows its tree to its new index
+    if (this.dragging) this.dragCluster = this.dragRoot >= 0 && this.dragRoot < n ? this.cluster[this.dragRoot] : -1;
     // title ranking: member count, ties by the root's locked value
     const ranked: number[] = [];
     for (let ci = 0; ci < next.length; ci++) if (next[ci].count >= TITLE_MIN) ranked.push(ci);
@@ -221,30 +264,102 @@ export class MapStore {
   /// preallocated arrays. Called on worker frames (every few while settling, once when settled), never
   /// per drawn frame. While the layout settles the anchors are smoothed so titles glide.
   refreshHulls() {
-    const { nx, ny, rT } = this;
     const ema = !this.settled;
-    for (const c of this.clusters) {
-      // anchors: centroid, enclosing radius, top edge (O(members))
-      const mem = c.members, mn = mem.length;
-      let sx = 0, sy = 0, k = 0;
-      for (let q = 0; q < mn; q++) { const i = mem[q], x = nx[i], y = ny[i]; if (x === x && y === y) { sx += x; sy += y; k++; } }
-      if (k) {
-        const cx = sx / k, cy = sy / k;
-        let cr = 0, minY = Infinity;
-        for (let q = 0; q < mn; q++) { const i = mem[q], x = nx[i], y = ny[i]; if (x !== x || y !== y) continue; const dx = x - cx, dy = y - cy, d = Math.sqrt(dx * dx + dy * dy) + rT[i]; if (d > cr) cr = d; const top = y - rT[i]; if (top < minY) minY = top; }
-        if (ema && c.anchored) { c.ccx += (cx - c.ccx) * ANCHOR_EMA; c.ccy += (cy - c.ccy) * ANCHOR_EMA; c.cr += (cr - c.cr) * ANCHOR_EMA; c.minY += (minY - c.minY) * ANCHOR_EMA; }
-        else { c.ccx = cx; c.ccy = cy; c.cr = cr; c.minY = minY; c.anchored = true; }
-      }
-      if (!c.big) { c.hullN = 0; continue; }
-      const pts: [number, number][] = [];
-      let maxR = 0;
-      for (const i of c.members) { pts.push([nx[i], ny[i]]); if (rT[i] > maxR) maxR = rT[i]; }
-      c.maxR = maxR;
-      const hull = pts.length >= 3 ? polygonHull(pts) ?? pts : pts;
-      if (c.hull.length < hull.length * 2) c.hull = new Float32Array(hull.length * 2 + 64);
-      for (let q = 0; q < hull.length; q++) { c.hull[q * 2] = hull[q][0]; c.hull[q * 2 + 1] = hull[q][1]; }
-      c.hullN = hull.length;
+    for (const c of this.clusters) this.measure(c, this.nx, this.ny, ema);
+    // a subtree being dragged is ahead of the worker: its tree is measured from the drawn positions
+    if (this.dragging && !this.dragWhole) this.dragDirty = true;
+  }
+
+  /// One tree's anchors (centroid, enclosing radius, top edge; EMA-smoothed when `ema`) and, for the
+  /// big ones, its hull, from positions xs/ys. O(members), no allocation once the scratch has grown.
+  measure(c: Cluster, xs: Float32Array, ys: Float32Array, ema: boolean) {
+    const rT = this.rT, mem = c.members, mn = mem.length;
+    let sx = 0, sy = 0, k = 0;
+    for (let q = 0; q < mn; q++) { const i = mem[q], x = xs[i], y = ys[i]; if (x === x && y === y) { sx += x; sy += y; k++; } }
+    if (k) {
+      const cx = sx / k, cy = sy / k;
+      let cr = 0, minY = Infinity;
+      for (let q = 0; q < mn; q++) { const i = mem[q], x = xs[i], y = ys[i]; if (x !== x || y !== y) continue; const dx = x - cx, dy = y - cy, d = Math.sqrt(dx * dx + dy * dy) + rT[i]; if (d > cr) cr = d; const top = y - rT[i]; if (top < minY) minY = top; }
+      if (ema && c.anchored) { c.ccx += (cx - c.ccx) * ANCHOR_EMA; c.ccy += (cy - c.ccy) * ANCHOR_EMA; c.cr += (cr - c.cr) * ANCHOR_EMA; c.minY += (minY - c.minY) * ANCHOR_EMA; }
+      else { c.ccx = cx; c.ccy = cy; c.cr = cr; c.minY = minY; c.anchored = true; }
     }
+    if (!c.big) { c.hullN = 0; return; }
+    let maxR = 0;
+    for (let q = 0; q < mn; q++) if (rT[mem[q]] > maxR) maxR = rT[mem[q]];
+    c.maxR = maxR;
+    if (c.hull.length < mn * 2 + 2) c.hull = new Float32Array(mn * 2 + 64);
+    c.hullN = convexHull(mem, xs, ys, c.hull);
+  }
+
+  /// Starts a drag of node i's subtree, or of its whole tree when `whole` (a root or a cluster was
+  /// grabbed). The moving set is collected once and marked in dragSet. Returns the moving indices.
+  beginDrag(i: number, whole: boolean): Int32Array {
+    this.endDrag();
+    const ci = this.cluster[i], c = ci >= 0 ? this.clusters[ci] : undefined;
+    const set = this.dragSet;
+    let ids: Int32Array<ArrayBuffer>;
+    if (c && (whole || this.parent[i] < 0)) {
+      ids = Int32Array.from(c.members);
+      for (let q = 0; q < ids.length; q++) set[ids[q]] = 1;
+    } else {
+      // breadth-first over the CSR child lists; the set doubles as the visited mark (a parent cycle in
+      // the data cannot loop)
+      const out: number[] = [i]; set[i] = 1;
+      const cs = this.childStart, cl = this.childList, ends = cs.length - 1;
+      for (let q = 0; q < out.length; q++) { const p = out[q]; if (p >= ends) continue; for (let e = cs[p]; e < cs[p + 1]; e++) { const ch = cl[e]; if (!set[ch]) { set[ch] = 1; out.push(ch); } } }
+      ids = Int32Array.from(out);
+    }
+    this.dragIds = ids; this.dragRoot = i; this.dragCluster = c ? ci : -1;
+    this.dragWhole = !!c && ids.length >= c.members.length;
+    this.dragDirty = false;
+    this.dragging = true;
+    return ids;
+  }
+
+  /// Moves the dragged nodes by (dx, dy) world units: drawn, previous and target positions alike, so
+  /// the frame interpolation keeps them where the pointer put them. A whole tree carries its centre,
+  /// title anchors and hull along; a subtree reshapes its tree, which is re-measured once per frame.
+  translateDrag(dx: number, dy: number) {
+    if (!this.dragging || (!dx && !dy)) return;
+    const { dragIds: ids, x, y, px, py, nx, ny } = this;
+    for (let q = 0; q < ids.length; q++) { const i = ids[q]; x[i] += dx; px[i] += dx; nx[i] += dx; y[i] += dy; py[i] += dy; ny[i] += dy; }
+    const c = this.dragCluster >= 0 ? this.clusters[this.dragCluster] : undefined;
+    if (!c) return;
+    if (this.dragWhole) {
+      c.cx += dx; c.cy += dy; c.ccx += dx; c.ccy += dy; c.minY += dy;
+      const hull = c.hull;
+      for (let q = 0; q < c.hullN; q++) { hull[q * 2] += dx; hull[q * 2 + 1] += dy; }
+    } else this.dragDirty = true;
+  }
+
+  /// Adds nodes to the drag in progress (a coin that arrived under a moving node travels with it).
+  /// Returns the indices that joined (a copy, for the worker).
+  joinDrag(add: ArrayLike<number>): Int32Array {
+    if (!this.dragging || !add.length) return new Int32Array(0);
+    const ids = new Int32Array(this.dragIds.length + add.length), joined: number[] = [];
+    ids.set(this.dragIds);
+    let k = this.dragIds.length;
+    for (let q = 0; q < add.length; q++) { const i = add[q]; if (i >= 0 && i < this.n && !this.dragSet[i]) { this.dragSet[i] = 1; ids[k++] = i; joined.push(i); } }
+    this.dragIds = ids.slice(0, k);
+    if (joined.length && !this.dragWhole) this.dragDirty = true;
+    return Int32Array.from(joined);
+  }
+
+  /// Re-measures the dragged tree from the drawn positions when a subtree drag reshaped it.
+  measureDrag() {
+    if (!this.dragDirty) return;
+    this.dragDirty = false;
+    const c = this.dragCluster >= 0 ? this.clusters[this.dragCluster] : undefined;
+    if (c) this.measure(c, this.x, this.y, false);
+  }
+
+  /// Ends the drag: the tree is measured once more, the marks are cleared.
+  endDrag() {
+    if (!this.dragging) return;
+    this.measureDrag();
+    const ids = this.dragIds, set = this.dragSet;
+    for (let q = 0; q < ids.length; q++) set[ids[q]] = 0;
+    this.dragging = false; this.dragRoot = -1; this.dragCluster = -1; this.dragWhole = false; this.dragIds = new Int32Array(0); this.dragDirty = false;
   }
 
   /// Marks the hovered node and its parent/children for the highlight pass; clears the previous mark.
