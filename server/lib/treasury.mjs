@@ -154,7 +154,11 @@ export class Treasury {
     this.stats.fees++;
     const c = this.model.get(coin.mint) ?? coin;
     const [r] = await this.readFees([c], rpc);
-    // A config the indexer has not fetched yet (a root launched elsewhere) is adopted on sight, as ensureShares would.
+    return this.#feeView(c, r);
+  }
+
+  /** The /api/fees view of one coin from its read balances; adopts a config the indexer has not fetched yet. */
+  #feeView(c, r) {
     if (r.shares && !c.shares) this.model.upsertCoin({ mint: c.mint, shares: r.shares, sharesAt: nowS() });
     const quoteMint = r.sol ? null : c.quoteMint;
     const decimals = this.model.decimalsOf(quoteMint);
@@ -171,4 +175,52 @@ export class Treasury {
       claimable: reason == null, reason, updatedAt: nowS(),
     };
   }
+
+  /**
+   * /api/fees views for many coins: fresh cache entries are reused, the rest are read in batches of
+   * COINS_PER_CALL (one getMultipleAccounts each) and written back to the per-mint cache, so the
+   * claim page and the coin page agree and neither costs a read per coin.
+   */
+  async feesMany(coins, { rpc = this.rpc } = {}) {
+    const out = new Map(), todo = [];
+    for (const coin of coins) {
+      const hit = this.feeCache.get(coin.mint);
+      if (hit?.value && this.now() - hit.at < this.feesTtlMs) out.set(coin.mint, hit.value); else todo.push(this.model.get(coin.mint) ?? coin);
+    }
+    if (todo.length) {
+      this.stats.fees += todo.length;
+      const rows = await this.readFees(todo, rpc);
+      for (const r of rows) {
+        const v = this.#feeView(r.c, r);
+        out.set(r.c.mint, v);
+        const entry = this.feeCache.get(r.c.mint) ?? { at: 0, value: null, inFlight: null };
+        entry.value = v; entry.at = this.now();
+        if (!this.feeCache.has(r.c.mint)) { this.feeCache.set(r.c.mint, entry); if (this.feeCache.size > FEES_CACHE_MAX) this.feeCache.delete(this.feeCache.keys().next().value); }
+      }
+    }
+    return coins.map((c) => out.get(c.mint)).filter(Boolean);
+  }
+}
+
+/** A wallet's slice of one coin's pending fees (raw quote units as a string, USD when priced). */
+export function shareOf(view, wallet) {
+  const s = (view.shares ?? []).find((x) => x.address === wallet);
+  const bps = s?.bps ?? 0;
+  const amount = (BigInt(view.total) * BigInt(bps)) / 10_000n;
+  return { yourBps: bps, yourAmount: amount.toString(), yourUsd: view.totalUsd != null && Number(view.total) > 0 ? (view.totalUsd * bps) / 10_000 : (view.totalUsd != null ? 0 : null) };
+}
+
+/** Totals of a claim list: USD overall and the raw amount per quote mint (SOL is quoteMint null). */
+export function claimTotals(rows, amountKey) {
+  const byQuote = new Map();
+  let usd = 0;
+  for (const r of rows) {
+    const k = r.quoteMint ?? "SOL";
+    const cur = byQuote.get(k) ?? { quoteMint: r.quoteMint, quoteSymbol: r.quoteSymbol, quoteDecimals: r.quoteDecimals, amount: 0n, usd: 0 };
+    cur.amount += BigInt(r[amountKey]);
+    const u = amountKey === "yourAmount" ? r.yourUsd : r.totalUsd;
+    if (u != null) { cur.usd += u; usd += u; }
+    byQuote.set(k, cur);
+  }
+  return { usd, byQuote: [...byQuote.values()].map((q) => ({ ...q, amount: q.amount.toString() })).sort((a, b) => b.usd - a.usd) };
 }

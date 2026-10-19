@@ -10,6 +10,7 @@ import { checkEligibility } from "./eligibility.mjs";
 import { PublicKey, PUMP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID, PUMP_FEE_PROGRAM_ID, VersionedTransaction } from "./sdk.mjs";
 import { META_NAME_RE, META_TYPES, QuotaError } from "./metahost.mjs";
 import { verifySpawnTx } from "./spawned.mjs";
+import { shareOf, claimTotals } from "./treasury.mjs";
 import { fromBase58 } from "./decode.mjs";
 import { launchFeeOf, DEFAULT_LAUNCH_FEE_SOL, splitShares } from "./pricing.mjs";
 import { securityHeaders, cors, rateLimit, requestLog, compression, sendCachedJson, sendSpaHtml, prepareJson, sendPrepared, RateLimiter } from "./http.mjs";
@@ -296,6 +297,44 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
     if (!treasury) return res.status(503).json({ error: "fees unavailable" });
     try { sendCachedJson(req, res, await treasury.fees(c, { rpc: apiRpc }), { maxAge: 5 }); }
     catch (e) { res.status(503).json({ error: `fees unavailable: ${String(e.message ?? e).slice(0, 200)}` }); }
+  }));
+
+  // The Claim page (DESIGN §11.7). /api/claims/:wallet lists every indexed coin whose fee-sharing
+  // config names the wallet, with its pending fees and the wallet's part; /api/claims lists the Spore
+  // launches with the most fees waiting (a payout is permissionless, anyone may trigger it). Both
+  // read the fee accounts in batches through the per-mint cache /api/fees uses. Nothing is signed.
+  const CLAIMS_MAX = 100, claimsPublic = { at: 0, value: null, inFlight: null }, CLAIMS_PUBLIC_MS = 30_000;
+  const claimRow = (c, v) => ({ ...model.ref(c), ...v, migrated: v.migrated });
+  app.get("/api/claims/:wallet", wrap(async (req, res) => {
+    const { wallet } = req.params;
+    if (!isMint(wallet)) return res.status(400).json({ error: "invalid wallet" });
+    if (!treasury) return res.status(503).json({ error: "claims unavailable" });
+    const coins = model.tracked().filter((c) => c.shares?.some((s) => s.address === wallet)).slice(0, CLAIMS_MAX);
+    try {
+      const views = await treasury.feesMany(coins, { rpc: apiRpc });
+      const byMint = new Map(coins.map((c) => [c.mint, c]));
+      const rows = views.map((v) => ({ ...claimRow(byMint.get(v.mint), v), ...shareOf(v, wallet) }))
+        .sort((a, b) => (b.yourUsd ?? -1) - (a.yourUsd ?? -1) || Number(BigInt(b.yourAmount) - BigInt(a.yourAmount)));
+      sendCachedJson(req, res, { wallet, coins: rows, totals: claimTotals(rows, "yourAmount"), updatedAt: nowS() }, { maxAge: 5 });
+    } catch (e) { res.status(503).json({ error: `claims unavailable: ${String(e.message ?? e).slice(0, 200)}` }); }
+  }));
+  app.get("/api/claims", wrap(async (req, res) => {
+    const limit = clampInt(req.query.limit, 50, 1, CLAIMS_MAX);
+    if (!treasury) return res.status(503).json({ error: "claims unavailable" });
+    const fresh = claimsPublic.value && now() - claimsPublic.at < CLAIMS_PUBLIC_MS;
+    if (!fresh) {
+      claimsPublic.inFlight ??= (async () => {
+        const coins = model.tracked().filter((c) => model.isOurCoin(c) && c.shares?.length);
+        const views = await treasury.feesMany(coins, { rpc: apiRpc });
+        const byMint = new Map(coins.map((c) => [c.mint, c]));
+        const rows = views.map((v) => claimRow(byMint.get(v.mint), v)).filter((r) => BigInt(r.total) > 0n)
+          .sort((a, b) => (b.totalUsd ?? -1) - (a.totalUsd ?? -1));
+        claimsPublic.value = { coins: rows, totals: claimTotals(rows, "total") }; claimsPublic.at = now();
+      })().finally(() => { claimsPublic.inFlight = null; });
+      try { await claimsPublic.inFlight; } catch (e) { if (!claimsPublic.value) return res.status(503).json({ error: `claims unavailable: ${String(e.message ?? e).slice(0, 200)}` }); }
+    }
+    const v = claimsPublic.value;
+    sendCachedJson(req, res, { coins: v.coins.slice(0, limit), totals: v.totals, updatedAt: Math.floor(claimsPublic.at / 1000) }, { maxAge: 10 });
   }));
 
   // The Spawn page reports a signed spawn so the coin shows as ours at once. Nothing is taken on

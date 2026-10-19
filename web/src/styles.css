@@ -673,3 +673,37 @@ section.hero > :nth-child(2) { animation-delay: .05s; } section.hero > :nth-chil
 html[data-motion="paused"] .official-badge i { animation: none; }
 @media (max-width: 900px) { .official-note { margin-left: 0; white-space: normal; flex-basis: 100%; } }
 @media (max-width: 520px) { .official-ca { font-size: 11px; } .official-link { display: none; } }
+
+/* ---- Claim page ---- */
+.claim-page { display: grid; gap: 22px; padding-bottom: 60px; }
+.claim-card { display: grid; gap: 16px; }
+.claim-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.claim-sub { margin: 6px 0 0; font-size: 13px; }
+.claim-totals { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.claim-totals em { display: block; font-style: normal; font-family: var(--mono, "Geist Mono", monospace); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.claim-totals b { font-size: 22px; font-family: var(--mono, "Geist Mono", monospace); }
+.claim-quotes { display: flex; gap: 8px; flex-wrap: wrap; }
+.claim-quotes span { font-size: 12px; padding: 4px 9px; border: 1px solid var(--line-2); border-radius: 999px; color: var(--ink-2, #dfeee0); }
+.claim-connect, .claim-empty { display: grid; gap: 12px; justify-items: start; padding: 8px 0; }
+.claim-table { display: grid; }
+.claim-row { display: grid; grid-template-columns: minmax(220px, 2fr) 0.7fr 1.2fr 1.2fr 140px; align-items: center; gap: 14px; padding: 12px 6px; border-top: 1px solid var(--line-soft); }
+.claim-table:not(:has(.claim-row > [data-label="Your share"])) .claim-row { grid-template-columns: minmax(220px, 2fr) 1.4fr 140px; }
+.claim-th { border-top: 0; padding-top: 0; font-family: var(--mono, "Geist Mono", monospace); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.claim-row.dim { opacity: .55; }
+.claim-row small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.claim-coin { display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; min-width: 0; }
+.claim-coin span { min-width: 0; }
+.claim-coin b { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.claim-coin:hover b { color: var(--accent); }
+.claim-act { justify-self: end; }
+.claim-why { font-size: 12px; }
+.btn.sm { padding: 7px 14px; font-size: 13px; }
+@media (max-width: 760px) {
+  .claim-row, .claim-table:not(:has(.claim-row > [data-label="Your share"])) .claim-row { grid-template-columns: 1fr auto; gap: 6px 12px; }
+  .claim-th { display: none; }
+  .claim-row > [data-label] { grid-column: 1; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
+  .claim-row > [data-label]::before { content: attr(data-label); color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; min-width: 78px; }
+  .claim-row > [data-label] small { display: inline; margin: 0; }
+  .claim-coin { grid-column: 1 / -1; }
+  .claim-act { grid-column: 2; grid-row: 2 / span 3; align-self: center; }
+}

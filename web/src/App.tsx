@@ -16,11 +16,12 @@ import CoinPage from "./pages/Coin";
 import Launch from "./pages/Launch";
 import How from "./pages/How";
 import Fees from "./pages/Fees";
+import Claim from "./pages/Claim";
 import NotFound from "./pages/NotFound";
 import "./components/brand.css";
 
 export const BRAND = { name: "Spore", tagline: "Coins that grow coins.", title: "Spore — coins that grow coins" };
-const PRIMARY = [["/explore", "Explore"], ["/map", "Map"], ["/launch", "Launch"], ["/how", "How it works"]] as const;
+const PRIMARY = [["/explore", "Explore"], ["/map", "Map"], ["/launch", "Launch"], ["/claim", "Claim"], ["/how", "How it works"]] as const;
 
 /// Finds a search box on the current page and focuses it. The pages own their search components;
 /// this only knows their markup (the shared Search box and the map's find box).
@@ -157,6 +158,7 @@ function Shell() {
             <Route path="/spawn" element={<Launch />} />
             <Route path="/how" element={<How />} />
             <Route path="/fees" element={<Fees />} />
+            <Route path="/claim" element={<Claim />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </div>

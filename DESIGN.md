@@ -193,6 +193,14 @@ The Map page is the one surface that shows the **whole pump.fun custom-pair ecos
 
 **Owner commitment (2026-10-19):** the platform's 50 % share of creator fees is used to buy the Spore coin ($SPORE, to be launched by the owner) and lock it; the site says so on Home, Fees, How, Launch and the footer. X account: https://x.com/Sporemap (footer link).
 
+### 11.7 Claim page
+
+`/claim` (nav item "Claim"): connect a wallet → every indexed coin whose fee-sharing config names it, with the pending fees, the wallet's share and part, a Claim button per coin (same build → simulate → confirm → wallet flow as the coin-page card) and "Claim all" (sequential, one wallet approval each; a refusal stops the run). Below: the Spore launches with fees waiting, claimable by anyone (the signer pays the network fee, the program pays the shareholders).
+
+- `GET /api/claims/:wallet` → `{ wallet, coins: [CoinRef & Fees & { yourBps, yourAmount, yourUsd }], totals: { usd, byQuote: [{ quoteMint, quoteSymbol, quoteDecimals, amount, usd }] }, updatedAt }`, max 100 coins, sorted by `yourUsd`; 400 on a malformed wallet.
+- `GET /api/claims?limit=50` → the Spore launches with `total > 0`, sorted by `totalUsd`, cached 30 s.
+- Both read fee accounts in batches (`Treasury.feesMany`, one getMultipleAccounts per 20 coins) through the 15 s per-mint cache `/api/fees` uses.
+
 ### 11.2 Launch fee
 `LAUNCH_FEE_SOL` env (code default `0.02`; **production runs 0 since 2026-10-19 by owner decision: launching costs only network fees, Spore earns only through the 50% creator-fee share**; the web pins 0.02 as the maximum it will ever sign). `GET /api/eligibility/:mint` returns `launchFee: { to: string; lamports: string; sol: number }`. The web passes it to `buildSpawnTx(..., launchFee)` (lib/pump already adds a SystemProgram transfer to the platform inside the create transaction). The Spawn page shows a cost box before signing: launch fee, estimated network rent (~0.025 SOL: mint + curve + fee-sharing config + vault ATA) and the optional first buy, with the total. A fee of 0 hides the line.
 

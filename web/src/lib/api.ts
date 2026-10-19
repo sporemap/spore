@@ -61,6 +61,10 @@ export type Fees = {
   shares: Shares | null; bucket: string; vault: string; amm: string; total: string; totalUsd: number | null; perShare: FeeShare[];
   migrated: boolean; claimable: boolean; reason: string | null; updatedAt: number;
 };
+/// One row of the Claim page (DESIGN §11.7): a coin's pending fees plus, for a wallet, its part.
+export type ClaimCoin = CoinRef & Fees & { yourBps?: number; yourAmount?: string; yourUsd?: number | null };
+export type ClaimTotals = { usd: number; byQuote: { quoteMint: string | null; quoteSymbol: string; quoteDecimals: number; amount: string; usd: number }[] };
+export type Claims = { wallet?: string; coins: ClaimCoin[]; totals: ClaimTotals; updatedAt: number };
 export type RootSort = "locked" | "children" | "new" | "volume";
 export type UploadBody = { name: string; symbol: string; description: string; image: string; twitter: string; telegram: string; website: string };
 
@@ -114,6 +118,8 @@ export const api = {
   candles: (mint: string, res = 60) => request<Candles>(`/candles/${encodeURIComponent(mint)}${qs({ res })}`),
   /// Pending creator fees of one coin (§11.6); the server reads the chain and caches 15 s per mint.
   fees: (mint: string) => request<Fees>(`/fees/${encodeURIComponent(mint)}`),
+  claimsFor: (wallet: string) => request<Claims>(`/claims/${encodeURIComponent(wallet)}`, {}, 30_000),
+  claims: (limit = 50) => request<Claims>(`/claims${qs({ limit })}`, {}, 30_000),
   search: (q: string, signal?: AbortSignal) => request<{ coins: Coin[] }>(`/search${qs({ q })}`, { signal }),
   eligibility: (mint: string, creator?: string | null) => request<Eligibility>(`/eligibility/${encodeURIComponent(mint)}${qs({ creator })}`),
   /// The SOL pool: a root coin needs no parent, but the split and launch fee are still the server's.
