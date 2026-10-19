@@ -1,0 +1,28 @@
+# Caddy in front of the Spore API: automatic TLS, HTTP/2, one upstream. Caddy sets
+# X-Forwarded-For / X-Forwarded-Proto, which the API trusts from loopback (TRUST_PROXY=loopback).
+# Replace spore.example with the real host; `caddy reload --config /etc/caddy/Caddyfile`.
+spore.example {
+	encode zstd gzip
+
+	# The API compresses its own JSON and sends ETag/Cache-Control; Caddy only adds TLS and
+	# streams SSE untouched (flush_interval -1 disables buffering for /api/events).
+	reverse_proxy 127.0.0.1:8793 {
+		flush_interval -1
+		transport http {
+			read_timeout 130s
+			dial_timeout 5s
+		}
+	}
+
+	# Uploads carry a ≤ 3 MB JSON body; everything else is tiny. Caddy's default is unlimited.
+	request_body {
+		max_size 4MB
+	}
+
+	log {
+		output file /var/log/caddy/spore.access.log {
+			roll_size 50MiB
+			roll_keep 7
+		}
+	}
+}

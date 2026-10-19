@@ -1,0 +1,106 @@
+/* Shell, footer and the brand-owned pages (How, Fees, 404). Everything here builds on the tokens
+   documented at the top of styles.css; nothing in this file is referenced by other agents' code. */
+
+/* ---------- skip link: the first tab stop, visible only while focused */
+.skip { position: fixed; left: 16px; top: 12px; z-index: calc(var(--z-toast) + 1); padding: 10px 14px; border-radius: 999px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 13px; transform: translateY(-200%); opacity: 0; transition: transform .2s var(--ease), opacity .2s; }
+.skip:focus-visible { transform: none; opacity: 1; outline-color: var(--ink); text-decoration: none; }
+main:focus { outline: none; }
+.noscript { padding: 16px var(--gutter); background: var(--warn-soft); color: var(--warn); font-size: 13px; text-align: center; }
+
+/* ---------- route transition: opacity only, so fixed children (the spore canvas) keep their containing block */
+.route { animation: route-in .28s var(--ease) both; min-width: 0; }
+@keyframes route-in { from { opacity: 0; } to { opacity: 1; } }
+main.map-main .route { height: 100%; }
+
+/* ---------- footer */
+.footer-grid { max-width: var(--content); margin: 0 auto; display: grid; gap: 28px; }
+.footer-col { display: grid; gap: 10px; align-content: start; font-size: 12px; line-height: 1.55; }
+.footer-col h4 { font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+.footer-col p { max-width: 42ch; }
+.footer-nav { display: grid; gap: 6px; }
+.footer-nav a { color: var(--ink-2); font-size: 13px; width: fit-content; }
+.footer-nav a.active { color: var(--accent); }
+.footer-bottom { max-width: var(--content); margin: 24px auto 0; padding-top: 16px; border-top: 1px solid var(--line-soft); display: flex; justify-content: space-between; gap: 12px 24px; flex-wrap: wrap; font-size: 11px; color: var(--faint); font-family: var(--mono); }
+.footer-bottom span { display: inline-flex; align-items: center; gap: 6px; }
+@media (min-width: 760px) { .footer-grid { grid-template-columns: 1.3fr 1fr 1fr 1.2fr; gap: 32px; } }
+/* Pause-animations switch: a labelled toggle, aria-pressed carries the state. */
+.motion-toggle { display: inline-flex; align-items: center; gap: 10px; height: 34px; padding: 0 12px 0 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--glass); color: var(--ink-2); font-size: 12px; font-weight: 500; width: fit-content; transition: border-color .15s, background .15s; }
+.motion-toggle:hover:not(:disabled) { border-color: var(--line-2); background: var(--glass-2); }
+.motion-toggle:disabled { opacity: .6; cursor: not-allowed; }
+.motion-toggle i { position: relative; width: 28px; height: 16px; border-radius: 999px; background: rgba(255,255,255,.12); transition: background .2s; flex: none; }
+.motion-toggle i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--ink); transition: transform .2s var(--ease), background .2s; }
+.motion-toggle[aria-pressed="true"] i { background: var(--accent); }
+.motion-toggle[aria-pressed="true"] i::after { transform: translateX(12px); background: var(--accent-ink); }
+.kbd-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.kbd-row span { display: inline-flex; align-items: center; gap: 6px; }
+kbd { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 5px; border: 1px solid var(--line-2); border-bottom-width: 2px; background: rgba(0,0,0,.3); font-family: var(--mono); font-size: 11px; color: var(--ink); }
+
+/* ---------- 404 */
+.nf { display: grid; gap: 20px; justify-items: center; text-align: center; padding: clamp(24px, 8vh, 72px) 0; max-width: 620px; margin: 0 auto; }
+.nf-mark { position: relative; width: 120px; height: 120px; display: grid; place-items: center; }
+.nf-mark svg { width: 96px; height: 96px; opacity: .9; filter: drop-shadow(0 0 28px rgba(182,255,92,.35)); animation: nf-float 5s ease-in-out infinite alternate; }
+.nf-mark::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1px dashed var(--line-2); animation: nf-spin 40s linear infinite; }
+@keyframes nf-float { from { transform: translateY(-4px) rotate(-3deg); } to { transform: translateY(4px) rotate(3deg); } }
+@keyframes nf-spin { to { transform: rotate(360deg); } }
+.nf h1 { font-size: clamp(34px, 6vw, 60px); }
+.nf .lead { text-align: center; }
+.nf .lead .mono { color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.nf-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.nf-search { width: 100%; max-width: 520px; text-align: left; }
+
+/* ---------- fees & rules */
+.fees { gap: var(--s6); }
+.fees-grid { display: grid; gap: 18px; max-width: 920px; }
+.fees-card { padding: 24px 26px; display: grid; gap: 14px; border-radius: var(--radius-xl); }
+.fees-card h2 { display: flex; align-items: center; gap: 12px; font-size: 20px; }
+.fees-card h2 i { width: 34px; height: 34px; border-radius: 11px; border: 1px solid var(--line-2); background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-style: normal; flex: none; }
+.fees-card h2 i svg { width: 18px; height: 18px; }
+.fees-card.violet h2 i { color: var(--violet-2); border-color: color-mix(in srgb, var(--violet) 45%, transparent); background: var(--violet-soft); }
+.fees-card.teal h2 i { color: var(--teal-2); border-color: color-mix(in srgb, var(--teal) 45%, transparent); background: var(--teal-soft); }
+.fees-card.warn h2 i { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
+.fees-card .prose { max-width: none; }
+/* The cost ledger: what one launch spends, line by line, with the live fee from the API. */
+.ledger { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 16px; font-size: 14px; }
+.ledger > div { display: contents; }
+.ledger dt, .ledger dd { margin: 0; padding: 12px 0; border-bottom: 1px solid var(--line-soft); min-width: 0; }
+.ledger > div:last-child dt, .ledger > div:last-child dd { border-bottom: 0; }
+.ledger dt { display: grid; gap: 2px; color: var(--ink); }
+.ledger dt small { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.ledger dd { text-align: right; white-space: nowrap; font-family: var(--mono); font-weight: 500; font-variant-numeric: tabular-nums; display: grid; justify-items: end; gap: 2px; align-content: start; }
+.ledger dd small { font-size: 11px; color: var(--faint); font-weight: 400; }
+.ledger dd.accent { color: var(--accent); font-size: 16px; }
+.ledger .who { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 999px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; border: 1px solid var(--line-soft); color: var(--muted); background: rgba(0,0,0,.25); width: fit-content; margin-top: 2px; }
+.ledger .who.spore { color: var(--accent); border-color: var(--line); background: var(--accent-soft); }
+/* 50/50 split, drawn once as a bar with the two shareholders under it. */
+.fees-split { display: grid; gap: 10px; padding: 16px 18px; border-radius: var(--radius-lg); background: rgba(0,0,0,.22); border: 1px solid var(--line-soft); }
+.fees-split-bar { display: flex; height: 12px; border-radius: 999px; overflow: hidden; gap: 2px; }
+.fees-split-bar i { display: block; height: 100%; }
+.fees-split-bar i.you { flex: 1; background: linear-gradient(90deg, var(--accent-2), var(--accent)); box-shadow: 0 0 12px rgba(182,255,92,.5); }
+.fees-split-bar i.spore { flex: 1; background: var(--faint); }
+.fees-split-rows { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.fees-split-rows div { display: grid; gap: 2px; font-size: 13px; }
+.fees-split-rows b { font-family: var(--mono); font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+.fees-split-rows div:first-child b { color: var(--accent); }
+.fees-split-rows div:last-child { text-align: right; }
+.fees-split-rows small { color: var(--muted); font-size: 12px; }
+.never { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.never li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 12px; align-items: start; font-size: 14px; line-height: 1.55; color: var(--ink-2); }
+.never li i { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; color: var(--bad); background: var(--bad-soft); border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent); font-style: normal; margin-top: 1px; }
+.never li i svg { width: 11px; height: 11px; }
+.never li b { color: var(--ink); }
+.depth-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.depth-row .depth { height: 26px; font-size: 12px; }
+.depth-row .ghost { display: inline-flex; align-items: center; height: 26px; padding: 0 10px; border-radius: 999px; border: 1px dashed var(--line-soft); color: var(--faint); }
+.fees-cta { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.fees-cta .hint { flex-basis: 100%; }
+@media (max-width: 560px) { .fees-card { padding: 20px; } .fees-split-rows b { font-size: 18px; } .ledger { font-size: 13px; } }
+
+/* ---------- how: the tightened layout keeps styles.css's .how-card; these are the new bits */
+.how-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); gap: 12px; max-width: 860px; }
+.how-fact { display: grid; gap: 4px; padding: 14px 16px; border-radius: var(--radius-lg); border: 1px solid var(--line); background: var(--glass); }
+.how-fact span { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.how-fact b { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.how-fact b.accent { color: var(--accent); }
+.how-fact small { font-size: 12px; color: var(--faint); }
+.how-foot { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.how-foot .hint a { color: var(--accent); }

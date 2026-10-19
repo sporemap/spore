@@ -1,0 +1,158 @@
+/* Coin page, trade widget, price chart, breadcrumb and stat extras. Uses the brand tokens from
+   styles.css (--accent, --violet, --teal, --bg, --text, --muted, --card, --line, --radius) and
+   adds only the classes these components introduce; the shared ones (.card, .seg, .btn, .chip,
+   .quote, .stat …) are restyled in place through a more specific selector, never redefined. */
+
+/* ---------- change pill (price tile, chart legend, mobile bar) */
+.delta { display: inline-flex; align-items: baseline; gap: 4px; margin-left: 8px; padding: 1px 7px; border-radius: 999px; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; vertical-align: middle; border: 1px solid var(--line-soft); color: var(--muted); background: rgba(0,0,0,.25); }
+.delta small { font-weight: 400; font-size: 10px; opacity: .75; }
+.delta.up { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); background: var(--good-soft); }
+.delta.down { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-soft); }
+.stat > span .delta { margin-left: 8px; }
+
+/* ---------- breadcrumb with coin images */
+.crumbs .crumb { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 4px; }
+.crumbs .crumb.quote { padding-left: 8px; }
+.crumbs .crumb .logo { width: 18px; height: 18px; border-radius: 50%; font-size: 9px; flex: none; }
+.crumbs .crumb.self { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--line-2); }
+.crumb-sol { width: 8px; height: 8px; border-radius: 50%; margin-right: 2px; background: linear-gradient(135deg, #9945ff, #14f195); display: inline-block; }
+
+/* ---------- header: copyable addresses */
+.addr-row { display: inline-flex; align-items: center; gap: 4px; }
+.copy { display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--faint); transition: color .15s, background .15s; }
+.copy svg { width: 13px; height: 13px; }
+.copy:hover { color: var(--accent); background: var(--accent-soft); }
+.coin-meta .links a + a { margin-left: 0; }
+
+/* ---------- trade widget */
+.trade .trade-field .bal { display: inline-flex; align-items: center; gap: 6px; border: 0; padding: 2px 6px; margin: -2px -6px; border-radius: 999px; background: transparent; font-family: var(--mono); font-size: 11px; color: var(--muted); transition: color .15s, background .15s; }
+.trade .trade-field .bal i { width: 10px; height: 10px; border-radius: 3px; border: 1px solid currentColor; opacity: .6; }
+.trade .trade-field .bal em { font-style: normal; color: var(--faint); }
+.trade .trade-field .bal:hover { color: var(--accent); background: var(--accent-soft); }
+.trade .amount .input:disabled { opacity: .5; }
+.trade .amount-usd { position: absolute; left: 14px; bottom: -16px; font-size: 11px; color: var(--faint); }
+.trade .amount:has(.amount-usd) { margin-bottom: 14px; }
+.trade .quick > button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.trade.sell .quick > button:hover:not(:disabled), .trade.sell .quick > button[aria-pressed="true"] { border-color: var(--violet); color: var(--violet-2); background: var(--violet-soft); }
+.slip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11px; }
+.slip .seg { margin-left: auto; }
+.slip-custom { position: relative; display: inline-flex; align-items: center; }
+.slip-custom .input { width: 74px; height: 28px; padding: 0 26px 0 10px; font-size: 12px; border-radius: 999px; }
+.slip-custom em { position: absolute; right: 10px; font-style: normal; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.trade .quote { position: relative; transition: border-color .3s; }
+.trade .quote.stale { border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.trade .quote-empty, .trade .quote-err { display: flex; gap: 8px; align-items: center; font-size: 12px; line-height: 1.5; }
+.trade .quote-err { justify-content: flex-start; overflow-wrap: anywhere; }
+.trade .quote > div.quote-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; row-gap: 0; padding-bottom: 8px; margin-bottom: 2px; border-bottom: 1px solid var(--line-soft); }
+.trade .quote-main > span { grid-column: 1 / -1; }
+.trade .quote-main b { font-size: 20px; letter-spacing: -0.02em; text-align: left; overflow-wrap: anywhere; }
+.trade .quote-usd { font-size: 11px; text-align: right; }
+.trade .quote-main b small, .trade .quote b small { font-family: var(--mono); font-size: 11px; font-weight: 400; }
+.trade .quote span small { font-size: 11px; }
+.trade .quote b.route { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; }
+.trade .quote b.route i { font-style: normal; color: var(--faint); margin: 0 4px; }
+.trade .quote b.warn { color: var(--warn); } .trade .quote b.bad { color: var(--bad); }
+.trade .quote-age { padding-top: 6px; border-top: 1px solid var(--line-soft); font-family: var(--mono); font-size: 11px; }
+.trade .quote-age .linkish { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+.trade .quote-age .linkish:disabled { opacity: .5; cursor: progress; }
+/* Scoped to the widget: launch.css also defines a global .spin, and whichever stylesheet loads last would otherwise win on both pages. */
+.trade .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.trade .trade-block { align-items: flex-start; flex-direction: column; }
+.trade .trade-block code { font-family: var(--mono); font-size: 12px; }
+.trade .btn.lg.block { width: 100%; }
+.trade .wallet-adapter-button-trigger { width: 100%; justify-content: center; height: 48px !important; font-size: 15px !important; }
+.trade .hint { margin-top: -4px; }
+
+/* confirm sheet: a small centred dialog on desktop, bottom-anchored on phones */
+.confirm-backdrop { position: fixed; inset: 0; z-index: var(--z-overlay); display: grid; place-items: center; padding: 16px; background: rgba(4,10,6,.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: fade .18s var(--ease); }
+.confirm { width: min(440px, 100%); display: grid; gap: 14px; padding: 20px 22px; border-radius: var(--radius-xl); background: color-mix(in srgb, var(--bg-1) 96%, transparent); border: 1px solid var(--line-2); box-shadow: 0 40px 80px -30px rgba(0,0,0,.95), var(--glow); animation: rise .22s var(--ease); }
+.confirm-head { display: flex; align-items: center; gap: 10px; }
+.confirm-head b { flex: 1; font-size: 15px; }
+.confirm-rows { display: grid; gap: 8px; font-size: 13px; }
+.confirm-rows > div { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.confirm-rows span { color: var(--muted); }
+.confirm-rows b { font-family: var(--mono); font-weight: 500; text-align: right; font-variant-numeric: tabular-nums; }
+.confirm-rows b small { font-size: 11px; color: var(--muted); font-weight: 400; }
+.confirm-rows b.warn { color: var(--warn); } .confirm-rows b.bad { color: var(--bad); }
+.confirm-rows b.route { font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
+.confirm-actions { display: grid; grid-template-columns: auto 1fr; gap: 8px; }
+.sheet-close { width: 30px; height: 30px; border: 0; border-radius: 999px; background: var(--glass-2); color: var(--muted); font-size: 18px; line-height: 1; display: grid; place-items: center; flex: none; }
+.sheet-close:hover { color: var(--ink); background: var(--glass-3); }
+@keyframes fade { from { opacity: 0; } }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } }
+@media (max-width: 560px) { .confirm-backdrop { align-items: end; padding: 0; } .confirm { width: 100%; border-radius: var(--radius-xl) var(--radius-xl) 0 0; padding-bottom: max(20px, env(safe-area-inset-bottom)); } }
+
+/* mobile: sticky bar + bottom sheet */
+.trade-bar { display: none; }
+.trade-sheet-backdrop { display: none; }
+@media (max-width: 980px) {
+  .coin-page.has-bar { padding-bottom: 72px; }
+  .trade-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: var(--z-nav); display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 10px var(--gutter) max(10px, env(safe-area-inset-bottom)); background: color-mix(in srgb, var(--bg-0) 86%, transparent); backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%); border-top: 1px solid var(--line); }
+  .trade-bar::before { content: ""; position: absolute; left: 0; right: 0; top: -1px; height: 1px; background: linear-gradient(90deg, transparent, rgba(182,255,92,.45) 30%, rgba(176,140,255,.3) 70%, transparent); }
+  .trade-bar-price { display: grid; gap: 1px; min-width: 0; }
+  .trade-bar-price b { font-size: 17px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .trade-bar-price .delta { margin-left: 0; }
+  .trade-bar .btn { height: 42px; padding: 0 22px; }
+  /* --z-overlay keeps toasts (--z-toast) readable above the sheet and the confirm dialog. */
+  .trade-sheet-backdrop { display: grid; align-items: end; position: fixed; inset: 0; z-index: var(--z-overlay); background: rgba(4,10,6,.7); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: fade .18s var(--ease); }
+  .trade-sheet { max-height: calc(100dvh - 24px); overflow: auto; overscroll-behavior: contain; animation: rise .25s var(--ease); -webkit-overflow-scrolling: touch; }
+  .trade-sheet .trade { border-radius: var(--radius-xl) var(--radius-xl) 0 0; padding-bottom: max(20px, env(safe-area-inset-bottom)); background: color-mix(in srgb, var(--bg-1) 97%, transparent); }
+  .trade-sheet .trade::before { display: none; }
+  .trade-sheet .trade::after { content: ""; position: absolute; top: 8px; left: 50%; width: 40px; height: 4px; border-radius: 2px; background: var(--line-2); transform: translateX(-50%); }
+}
+.trade-sheet-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center; padding-top: 6px; }
+.trade-sheet-head > div { display: grid; gap: 1px; min-width: 0; }
+.trade-sheet-head b { font-size: 15px; }
+.trade-sheet-head span { font-size: 12px; }
+
+/* ---------- price chart */
+.chart .chart-head { align-items: center; }
+.chart-legend { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.chart-legend .delta { margin-left: 0; }
+.ohlc { font-size: 11px; color: var(--ink-2); display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.ohlc i { font-style: normal; color: var(--faint); margin-right: 1px; }
+.ohlc em { font-style: normal; }
+.chart-ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.chart-stage { position: relative; }
+.chart-box { height: 320px; width: 100%; }
+.chart.empty-state .chart-box { visibility: hidden; height: 240px; }
+.chart-overlay { position: absolute; inset: 0; display: grid; }
+.chart-overlay .empty { align-content: center; }
+.chart-sk { height: 100% !important; }
+.chart-foot { font-family: var(--mono); font-size: 11px; display: flex; gap: 8px; align-items: center; }
+.chart-foot::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--good); box-shadow: 0 0 8px var(--good); }
+/* Phones: open/high/low only while a finger is on the chart; close + volume otherwise. */
+@media (max-width: 640px) { .chart-box { height: 260px; } .chart .chart-head { align-items: flex-start; flex-direction: column; } .ohlc { font-size: 10px; } .ohlc:not(.hovering) .ohl { display: none; } }
+
+/* ---------- trades tape */
+.tape .section-head { align-items: center; }
+.tape-ctl { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tape-table { display: grid; margin: 0 -8px; }
+.tape .tape-row { display: grid; grid-template-columns: 74px 50px minmax(0, 1.1fr) minmax(0, 1.1fr) 92px 80px 74px; gap: 10px; align-items: center; padding: 7px 8px; border-bottom: 1px solid var(--line-soft); border-radius: 8px; font-size: 12px; transition: background .15s; }
+.tape .tape-row:last-child { border-bottom: 0; }
+.tape .tape-row:hover { background: var(--glass); }
+.tape .tape-row.head { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); border-bottom: 1px solid var(--line); border-radius: 0; padding-top: 0; }
+.tape .tape-row.head:hover { background: transparent; }
+.tape .tape-row .t { display: grid; gap: 0; line-height: 1.2; }
+.tape .tape-row .t small { font-size: 10px; color: var(--faint); }
+.tape .tape-row .amt { font-weight: 500; }
+.tape .tape-row.buy .amt { color: var(--good); }
+.tape .tape-row.sell .amt { color: var(--bad); }
+.tape .tape-row .val, .tape .tape-row .who { text-align: right; }
+.tape .tape-row .who:hover { color: var(--accent); }
+.tape .tape-row.fresh { animation: tape-in 1.6s ease-out; }
+@keyframes tape-in { 0% { background: rgba(var(--accent-rgb), .22); transform: translateX(-4px); } 30% { background: rgba(var(--accent-rgb), .14); transform: none; } 100% { background: transparent; } }
+.tape .tape-row.sell.fresh { animation-name: tape-in-sell; }
+@keyframes tape-in-sell { 0% { background: rgba(255,107,122,.2); transform: translateX(-4px); } 30% { background: rgba(255,107,122,.12); transform: none; } 100% { background: transparent; } }
+.tape-foot { font-size: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+/* Phones: time · side · amount · price · value; the quote leg and the trader move to the tooltip/link. */
+@media (max-width: 760px) {
+  .tape { padding: 16px 14px; }
+  .tape-table { margin: 0 -6px; }
+  .tape .tape-row { grid-template-columns: 34px 40px minmax(0, 1fr) 72px 60px; gap: 6px; padding: 7px 6px; font-size: 11px; }
+  .tape .tape-row > :nth-child(4), .tape .tape-row .who { display: none; }
+  .tape .tape-row .t small { display: none; }
+  .tape .tape-row .chip { height: 20px; padding: 0 6px; font-size: 10px; }
+  .tape .tape-row .amt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}

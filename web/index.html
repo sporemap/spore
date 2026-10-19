@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Title template: pages set "<Page> · Spore"; the home page and crawlers get this one. -->
+    <title>Spore — coins that grow coins</title>
+    <meta name="description" content="Spore is a pump.fun launchpad for family trees: launch a root coin with SOL, launch children quoted in it, keep half of the creator fees. 0.02 SOL per launch, nothing custodial." />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#07100b" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <meta name="application-name" content="Spore" />
+    <meta name="apple-mobile-web-app-title" content="Spore" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- site.webmanifest, not manifest.webmanifest: the dev proxy forwards every /m* path to the API. -->
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <!-- The share URLs are absolute, so the deployment origin is filled in by the inline script
+         below, which also adds the canonical link (a static href="/" would make Vite's build try to
+         read the public directory as a file). Crawlers reading the static HTML get path-absolute
+         fallbacks. -->
+    <meta property="og:site_name" content="Spore" />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:url" content="/" />
+    <meta property="og:title" content="Spore — coins that grow coins" />
+    <meta property="og:description" content="A pump.fun launchpad for family trees. Launch a root with SOL, launch children under it, keep half of the creator fees. 0.02 SOL per launch, nothing custodial." />
+    <meta property="og:image" content="/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Spore: coins that grow coins. A root coin quoted in SOL with a child and a grandchild growing out of it." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Spore — coins that grow coins" />
+    <meta name="twitter:description" content="A pump.fun launchpad for family trees. Launch a root with SOL, launch children under it, keep half of the creator fees." />
+    <meta name="twitter:image" content="/og.png" />
+    <meta name="twitter:image:alt" content="Spore: coins that grow coins." />
+    <script nonce="__CSP_NONCE__">
+      // Absolute share URLs without baking a hostname into the build: the page knows its origin.
+      (function () {
+        var o = location.origin, abs = function (sel, v) { var el = document.querySelector(sel); if (el) el.setAttribute(el.tagName === "LINK" ? "href" : "content", v); };
+        var c = document.createElement("link"); c.rel = "canonical"; c.href = o + location.pathname; document.head.appendChild(c);
+        abs('meta[property="og:url"]', o + location.pathname);
+        abs('meta[property="og:image"]', o + "/og.png");
+        abs('meta[name="twitter:image"]', o + "/og.png");
+        // The "pause animations" preference is applied before the first paint so nothing flickers.
+        try { if (localStorage.getItem("spore:motion") === "paused") document.documentElement.dataset.motion = "paused"; } catch (e) {}
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Preloading the stylesheet starts the font request before the app bundle parses; display=swap keeps text visible meanwhile. -->
+    <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" />
+  </head>
+  <body>
+    <!-- Static background: three slow aurora blobs, film grain and a vignette. Lives outside the
+         React root so it never re-renders and is painted once, behind everything. -->
+    <div class="bg" aria-hidden="true"><i class="bg-a"></i><i class="bg-b"></i><i class="bg-c"></i><b class="bg-grain"></b><b class="bg-vignette"></b></div>
+    <div id="root"></div>
+    <noscript><div class="noscript">Spore builds every transaction in your browser, so it needs JavaScript. Enable it and reload.</div></noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

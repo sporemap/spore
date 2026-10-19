@@ -1,0 +1,51 @@
+# systemd unit for the Spore API (alternative to PM2). Install:
+#   sudo useradd --system --home /opt/spore --shell /usr/sbin/nologin spore
+#   sudo cp deploy/spore-api.service /etc/systemd/system/
+#   sudo install -o spore -g spore -m 600 deploy/.env /opt/spore/deploy/.env   # from env.example
+#   sudo systemctl daemon-reload && sudo systemctl enable --now spore-api
+#   journalctl -u spore-api -f
+[Unit]
+Description=Spore API (pump.fun family-tree launchpad: indexer + JSON API + static web)
+Documentation=file:///opt/spore/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spore
+Group=spore
+WorkingDirectory=/opt/spore/server
+EnvironmentFile=/opt/spore/deploy/.env
+Environment=NODE_ENV=production
+Environment=PORT=8793
+Environment=TRUST_PROXY=loopback
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning --max-old-space-size=1024 /opt/spore/server/index.mjs
+Restart=always
+RestartSec=3
+# index.mjs ends SSE streams, finishes in-flight requests and checkpoints sqlite within 8 s of SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=12
+LimitNOFILE=65536
+
+# Hardening: the process needs to write only its data dir, the metadata directory it publishes,
+# and wrangler's scratch dir under the repo root (.wrangler). Everything else is read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/spore/server/data /opt/spore/deploy/pages /opt/spore/.wrangler /opt/spore/logs
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+# wrangler reads the Cloudflare token from ~/.cloudflare-token of the service user; with
+# ProtectHome=true that path must be inside /opt/spore (set HOME accordingly) — see DEPLOY.md.
+Environment=HOME=/opt/spore
+
+[Install]
+WantedBy=multi-user.target

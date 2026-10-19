@@ -1,0 +1,20 @@
+{
+  "name": "spore-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning index.mjs",
+    "dev": "BACKFILL_LIMIT=150 node --disable-warning=ExperimentalWarning index.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.mjs",
+    "fixtures": "node scripts/capture-fixtures.mjs"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@pump-fun/pump-sdk": "4.1.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "express": "^4.22.3"
+  }
+}

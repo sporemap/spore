@@ -1,0 +1,24 @@
+{
+  "name": "Spore — coins that grow coins",
+  "short_name": "Spore",
+  "description": "A pump.fun launchpad for family trees: launch a root coin with SOL, launch children under it, keep half of the creator fees.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#07100b",
+  "theme_color": "#07100b",
+  "lang": "en",
+  "categories": ["finance"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Launch a coin", "url": "/launch", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Explore launches", "url": "/explore", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Ecosystem map", "url": "/map", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

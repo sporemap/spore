@@ -1,0 +1,16 @@
+node_modules/
+server/data/
+web/dist/
+web/dist-lib/
+.env
+.env.*
+*.log
+logs/
+.wrangler/
+.DS_Store
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.pem
+*.key
+*keypair*.json

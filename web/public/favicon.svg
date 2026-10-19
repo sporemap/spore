@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Favicon: the mark on a dark rounded tile, so the lime reads on light tab bars too. The
+       violet speck is a touch larger than in mark.svg: at 16px it would otherwise vanish. -->
+  <defs>
+    <radialGradient id="seed" cx="36%" cy="32%" r="70%">
+      <stop offset="0" stop-color="#eaffc4"/>
+      <stop offset=".5" stop-color="#b6ff5c"/>
+      <stop offset="1" stop-color="#7ed32f"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0b1a12"/>
+  <rect x=".5" y=".5" width="63" height="63" rx="13.5" fill="none" stroke="#b6ff5c" stroke-opacity=".22"/>
+  <g transform="translate(6.5 6.5) scale(.8)">
+    <path d="M49.21 32.16A22 22 0 1 1 35.11 17.18A11 11 0 0 0 49.21 32.16Z" fill="url(#seed)"/>
+    <circle cx="48" cy="19" r="7" fill="#5ce0c8"/>
+    <circle cx="59.5" cy="7.5" r="4.6" fill="#b08cff"/>
+  </g>
+</svg>
