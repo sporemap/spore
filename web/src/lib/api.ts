@@ -26,7 +26,8 @@ export type Stats = {
   /// "ours" lists only coins launched here (§11.1); ourCoins/otherChildren let the UI say how many exist elsewhere.
   mode?: "ours" | "all"; ourCoins?: number; otherChildren?: number;
 };
-export type Trade = { sig: string; mint: string; slot: number; time: number; isBuy: boolean; user: string; baseAmount: string; quoteAmount: string; priceQuote: number; priceUsd: number | null };
+/// `valueUsd`: the trade's size in dollars (null when the quote has no USD price); an older server leaves it out.
+export type Trade = { sig: string; mint: string; slot: number; time: number; isBuy: boolean; user: string; baseAmount: string; quoteAmount: string; priceQuote: number; priceUsd: number | null; valueUsd?: number | null };
 export type TreeNode = { coin: Coin; children: TreeNode[] };
 /// One bubble of the ecosystem map: a CoinRef plus the few numbers a bubble is sized and labelled by.
 /// `parentMint` and `updatedAt` arrive on the flat delta variant (DESIGN §11.5); `ours` marks a Spore launch.
@@ -42,6 +43,10 @@ export type PairEvent = { coin: MapCoin; parent: MapCoin };
 /// SSE `mapdelta`: numbers that moved since the last batch (≤ every 3 s, ≤ 500 entries).
 export type MapDeltaEntry = { mint: string; mcapUsd: number | null; lockedUsd: number | null; children: number; descendants: number; migrated: boolean; name?: string | null; symbol?: string | null; image?: string | null };
 export type MapDeltaEvent = { at: number; updated: MapDeltaEntry[] };
+/// `GET /api/map/heat` (§11.5 "Activity (heat)"): parallel arrays, one entry per tracked coin with at least
+/// one trade in the last 24 h, sorted by trades in the last hour, then 24 h volume. `at`, `since` and `last`
+/// are unix seconds; `v24` is USD to the cent. A sidecar of /api/map because it decays without row updates.
+export type HeatResponse = { at: number; since: number; mint: string[]; t1h: number[]; n24: number[]; v24: number[]; last: number[]; buys1h: number[] };
 /// Lamports are a string on the wire so a big value survives JSON; `sol` is the same amount for display.
 export type LaunchFeeInfo = { to: string; lamports: string; sol: number };
 /// `pool` names what the new coin is quoted in: "sol" for a root coin (no parent), else the parent mint.
@@ -108,14 +113,19 @@ export const api = {
   stats: () => request<Stats>("/stats"),
   feed: (limit = 50, before?: number) => request<{ coins: Coin[] }>(`/feed${qs({ limit, before })}`),
   roots: (sort: RootSort = "locked", limit = 50, offset = 0) => request<{ roots: Coin[] }>(`/roots${qs({ sort, limit, offset })}`),
-  coin: (mint: string) => request<CoinPage>(`/coin/${encodeURIComponent(mint)}`),
+  /// `children: false` / `trades: false` ask the server to leave those lists empty (the map's side panel
+  /// needs only the coin); the fields are always present. An older server ignores the flags.
+  coin: (mint: string, opts?: { children?: boolean; trades?: boolean }) => request<CoinPage>(`/coin/${encodeURIComponent(mint)}${qs({ children: opts?.children === false ? 0 : undefined, trades: opts?.trades === false ? 0 : undefined })}`),
   tree: (mint: string, depth = 2) => request<TreeNode>(`/tree/${encodeURIComponent(mint)}${qs({ depth })}`),
   /// `scope: "all"` = every pump.fun pair the indexer knows (the map), not only Spore launches;
   /// `limit: "all"` = no root cap; `since` = only what changed after that `generatedAt` (§11.5).
   /// The full tree can be a few MB, so it gets a longer timeout than a card fetch.
   /// With `limit: "all"` the depth is left to the server (its program depth cap), so every client shares one cached build.
   map: ({ limit = 60, depth, scope = "ours", since }: MapQuery = {}) => request<MapResponse>(`/map${qs({ limit, depth: depth ?? (limit === "all" ? undefined : 2), scope: scope === "all" ? "all" : undefined, since })}`, {}, 60_000),
-  candles: (mint: string, res = 60) => request<Candles>(`/candles/${encodeURIComponent(mint)}${qs({ res })}`),
+  /// `scope: "all"` opens the candles of any tracked coin (the map's side panel); without it the route stays ours-only.
+  candles: (mint: string, res = 60, scope?: "all") => request<Candles>(`/candles/${encodeURIComponent(mint)}${qs({ res, scope })}`),
+  /// Trade activity per coin for the map (§11.5): 1 h and 24 h counters. 404 on a server that predates it.
+  heat: () => request<HeatResponse>("/map/heat", {}, 15_000),
   /// Pending creator fees of one coin (§11.6); the server reads the chain and caches 15 s per mint.
   fees: (mint: string) => request<Fees>(`/fees/${encodeURIComponent(mint)}`),
   claimsFor: (wallet: string) => request<Claims>(`/claims/${encodeURIComponent(wallet)}`, {}, 30_000),

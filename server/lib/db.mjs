@@ -118,6 +118,7 @@ export class Db {
       tradeCount: p("SELECT COUNT(*) AS n FROM trades WHERE mint = ?"),
       tradesFor: p("SELECT * FROM trades WHERE mint = ? ORDER BY time DESC, rowid DESC LIMIT ?"),
       tradesSince: p("SELECT * FROM trades WHERE mint = ? AND time >= ? ORDER BY time ASC, rowid ASC"),
+      tradesWindow: p("SELECT mint, time, is_buy, value_usd FROM trades WHERE time >= ? ORDER BY time, rowid"),
       vol24: p("SELECT COUNT(*) AS n, COALESCE(SUM(value_usd), 0) AS usd FROM trades WHERE mint = ? AND time >= ?"),
       vol24All: p("SELECT mint, COUNT(*) AS n, COALESCE(SUM(value_usd), 0) AS usd FROM trades WHERE time >= ? GROUP BY mint"),
       metaGet: p("SELECT * FROM meta WHERE uri = ?"),
@@ -176,15 +177,24 @@ export class Db {
     }));
   }
 
-  /** Inserts a trade and keeps at most `keep` rows per mint (DESIGN §6.5: 2 000); the count is an indexed lookup. */
+  /**
+   * Inserts a trade and keeps at most `keep` rows per mint (DESIGN §6.5: 2 000); the count is an
+   * indexed lookup. Returns whether the row is new: a replayed (sig, mint, idx) — the live stream
+   * re-delivers after a reconnect — is ignored, so the in-memory activity counters never count it twice.
+   */
   insertTrade(t, keep = 2000) {
-    this.q.tradeInsert.run({ sig: t.sig, mint: t.mint, idx: t.idx ?? 0, slot: t.slot, time: t.time, isBuy: t.isBuy ? 1 : 0, user: t.user, baseAmount: t.baseAmount, quoteAmount: t.quoteAmount, priceQuote: t.priceQuote, priceUsd: t.priceUsd ?? null, valueUsd: t.valueUsd ?? null });
+    const r = this.q.tradeInsert.run({ sig: t.sig, mint: t.mint, idx: t.idx ?? 0, slot: t.slot, time: t.time, isBuy: t.isBuy ? 1 : 0, user: t.user, baseAmount: t.baseAmount, quoteAmount: t.quoteAmount, priceQuote: t.priceQuote, priceUsd: t.priceUsd ?? null, valueUsd: t.valueUsd ?? null });
+    if (!(Number(r.changes) > 0)) return false;
     if (this.q.tradeCount.get(t.mint).n > keep) this.q.tradeTrim.run(t.mint, t.mint, keep);
+    return true;
   }
   static trade(r) { return { sig: r.sig, mint: r.mint, slot: r.slot, time: r.time, isBuy: !!r.is_buy, user: r.user, baseAmount: r.base_amount, quoteAmount: r.quote_amount, priceQuote: r.price_quote, priceUsd: r.price_usd, valueUsd: r.value_usd }; }
   tradesFor(mint, limit = 50) { return this.q.tradesFor.all(mint, limit).map(Db.trade); }
   tradesSince(mint, since) { return this.q.tradesSince.all(mint, since).map(Db.trade); }
+  /** Every stored trade at or after `sinceS`, oldest first (trades_time index): what seeds the activity counters at boot. */
+  tradesWindow(sinceS) { return this.q.tradesWindow.all(sinceS).map((r) => ({ mint: r.mint, time: r.time, isBuy: !!r.is_buy, valueUsd: r.value_usd })); }
   volume24h(mint) { const r = this.q.vol24.get(mint, now() - 86_400); return { trades: r.n, usd: r.usd }; }
+  /** A fresh GROUP BY over 24 h of trades; the API reads the in-memory counters (activity.mjs) instead, this is their reference. */
   volume24hAll() { return new Map(this.q.vol24All.all(now() - 86_400).map((r) => [r.mint, { trades: r.n, usd: r.usd }])); }
 
   metaGet(uri) { const r = this.q.metaGet.get(uri); return r ? Db.meta(r) : null; }

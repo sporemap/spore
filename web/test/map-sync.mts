@@ -2,7 +2,8 @@
 // test/map-mock-api.mts, which serves the exact wire shapes and a real SSE stream. Through CDP (no
 // puppeteer): cold load = one full request and a filled cache; touched nodes come back through
 // `since=` only (no full reload, no layout restart); `mapdelta` and `pair` events patch the map live;
-// a reload paints from the cache before the network answers and asks only for the delta.
+// a reload paints from the cache before the network answers and asks only for the delta; a cache whose
+// last complete load is older than 15 min re-syncs in full (one request, no since=).
 //
 //   node --import tsx test/map-mock-api.mts &                # :8798, proxies the rest to :8795
 //   API_PORT=8798 npx vite --port 5233 --host 127.0.0.1 &    # dev server on the mock
@@ -36,7 +37,7 @@ try {
   let id = 0; const pending = new Map<number, { res: (v: unknown) => void; rej: (e: Error) => void }>();
   ws.onmessage = (ev) => {
     const m = JSON.parse(String(ev.data)) as { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { message: string } };
-    if (m.id && pending.has(m.id)) { const { res, rej } = pending.get(m.id)!; pending.delete(m.id); m.error ? rej(new Error(m.error.message)) : res(m.result); return; }
+    if (m.id && pending.has(m.id)) { const { res, rej } = pending.get(m.id)!; pending.delete(m.id); if (m.error) rej(new Error(m.error.message)); else res(m.result); return; }
     if (m.method === "Runtime.consoleAPICalled") { const p = m.params as { type: string; args: { value?: unknown; description?: string }[] }; if (p.type === "error") errors.push(`console.error: ${p.args.map((a) => a.value ?? a.description ?? "").join(" ")}`); }
     if (m.method === "Runtime.exceptionThrown") { const p = m.params as { exceptionDetails: { text: string; exception?: { description?: string } } }; errors.push(`exception: ${p.exceptionDetails.exception?.description ?? p.exceptionDetails.text}`); }
     if (m.method === "Log.entryAdded") { const p = m.params as { entry: { level: string; source: string; text: string } }; if (p.entry.level === "error" && p.entry.source !== "network") errors.push(`${p.entry.source}: ${p.entry.text}`); }
@@ -47,7 +48,8 @@ try {
   await send("Page.enable", {}, S); await send("Runtime.enable", {}, S); await send("Log.enable", {}, S);
   const evalJs = async <T,>(expression: string): Promise<T> => { const r = (await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, S)) as { result: { value: T }; exceptionDetails?: { text: string } }; if (r.exceptionDetails) throw new Error(`eval failed: ${r.exceptionDetails.text} :: ${expression.slice(0, 80)}`); return r.result.value; };
   const waitFor = async (expression: string, timeoutMs: number, what: string) => { const t0 = Date.now(); while (Date.now() - t0 < timeoutMs) { let v: unknown = null; try { v = await evalJs(expression); } catch { /* loading */ } if (v) return v; await sleep(100); } throw new Error(`timeout waiting for ${what}`); };
-  const mapRequests = () => evalJs<{ url: string; ms: number }[]>(`performance.getEntriesByType("resource").filter((e) => /\\/api\\/map/.test(e.name)).map((e) => ({ url: e.name.replace(/^.*\\/api\\/map/, "/api/map"), ms: Math.round(e.duration) }))`);
+  // /api/map itself (the tree and its deltas), not the /api/map/heat sidecar
+  const mapRequests = () => evalJs<{ url: string; ms: number }[]>(`performance.getEntriesByType("resource").filter((e) => /\\/api\\/map(\\?|$)/.test(e.name)).map((e) => ({ url: e.name.replace(/^.*\\/api\\/map/, "/api/map"), ms: Math.round(e.duration) }))`);
 
   // ---- cold: one full request, bubbles, cache filled
   await send("Page.navigate", { url: `${BASE}/map?roots=all` }, S);
@@ -112,6 +114,20 @@ try {
   // a node that never had its position saved (inserted live, then a hard reload) earns a short relaxation; the rest must not move
   check(warm.fp - warm.mounted < 500, `warm paint took ${Math.round(warm.fp - warm.mounted)} ms after mount`);
   await waitFor("__sporeMap.settled()", 20_000, "warm open to settle").catch(() => fails.push("warm open did not settle within 20 s"));
+
+  // ---- stale full load: the cache's last complete load is 20 min old, so the reopen re-syncs in full
+  // (bounds the USD drift of a warm cache: since= only carries coins whose own row changed)
+  const stamped = await evalJs<string>(`new Promise((res) => { const r = indexedDB.open("spore-map"); r.onerror = () => res("open failed"); r.onsuccess = () => { const db = r.result; const tx = db.transaction("meta", "readwrite"); tx.objectStore("meta").put({ key: "full", at: Date.now() - 20 * 60_000 }); tx.oncomplete = () => { db.close(); res("ok"); }; tx.onerror = () => res("write failed"); }; })`);
+  check(stamped === "ok", `could not age the 'full' record (${stamped})`);
+  await evalJs("window.__oldDoc = 1");
+  await send("Page.reload", {}, S);
+  await waitFor("!window.__oldDoc", 30_000, "new document");
+  await waitFor("!!(window.__sporeMap && window.__sporeMapPage && window.__sporeMap.firstPaintAt() > 0)", 60_000, "warm first paint (stale full)");
+  await sleep(4000);
+  const reqs4 = await mapRequests();
+  result.staleFullRequests = reqs4;
+  check(reqs4.length === 1 && !/since=/.test(reqs4[0].url) && /limit=all/.test(reqs4[0].url), `a stale 'full' record must make exactly one full /api/map request without since= (got ${JSON.stringify(reqs4.map((r) => r.url))})`);
+  check((await evalJs<{ count: number } | null>("__sporeMapPage.cacheInfo()")) != null, "the stale-full reopen did not paint from the cache first");
   ws.close();
 } catch (e) {
   fails.push(`crashed: ${(e as Error).message}`);

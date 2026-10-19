@@ -91,7 +91,7 @@ export default function CoinPage() {
   const quoteDecimals = extras.quoteDecimals ?? (coin.quoteMint === null ? 9 : 6);
   const lockedQuote = tokens(coin.lockedQuote, coin.decimals);
   const priceMain = coin.priceUsd != null ? usd(coin.priceUsd) : price(coin.priceQuote, coin.quoteSymbol);
-  const copy = async (text: string, what: string) => { (await copyText(text)) ? toast.success(`${what} copied`) : toast.error(`Could not copy the ${what.toLowerCase()}`); };
+  const copy = async (text: string, what: string) => { if (await copyText(text)) toast.success(`${what} copied`); else toast.error(`Could not copy the ${what.toLowerCase()}`); };
   const shownTrades = tapeFilter === "all" ? trades : trades.filter((t) => (tapeFilter === "buy") === t.isBuy);
   const buys = trades.filter((t) => t.isBuy).length;
   const solUsd = stats?.solUsd ?? null;
@@ -140,7 +140,7 @@ export default function CoinPage() {
         <div className="coin-main">
           <PriceChart coin={coin} />
           <section className="card tree-card">
-            <div className="section-head"><h2>Family tree</h2><span className="muted">{count(coin.descendants)} descendant{coin.descendants === 1 ? "" : "s"} · {coin.ancestors.length} ancestor{coin.ancestors.length === 1 ? "" : "s"} · <Link to="/map" className="more">whole ecosystem →</Link></span></div>
+            <div className="section-head"><h2>Family tree</h2><span className="muted">{count(coin.descendants)} descendant{coin.descendants === 1 ? "" : "s"} · {coin.ancestors.length} ancestor{coin.ancestors.length === 1 ? "" : "s"} · <Link to={`/map?focus=${coin.mint}`} className="more">whole ecosystem →</Link></span></div>
             <CoinBubbleMap mint={coin.mint} height={520} />
           </section>
           <section>

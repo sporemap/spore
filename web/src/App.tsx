@@ -64,7 +64,11 @@ function useShortcuts() {
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing || typing(e.target)) return;
       if (e.key === "/") { e.preventDefault(); if (!focusSearch()) { wantSearch.current = true; nav("/explore"); } }
-      else if (e.key === "l" || e.key === "L") { e.preventDefault(); nav("/launch"); }
+      else if (e.key === "l" || e.key === "L") {
+        // On the map with a coin selected, L launches under that coin (the map page handles it).
+        if (window.location.pathname === "/map" && new URLSearchParams(window.location.search).has("focus")) return;
+        e.preventDefault(); nav("/launch");
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

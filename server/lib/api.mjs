@@ -73,6 +73,7 @@ export function rpcParamsError(method, params) {
 
 const clampInt = (v, def, min, max) => { const n = Number.parseInt(v, 10); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const byLocked = (a, b) => (b.lockedUsd ?? -1) - (a.lockedUsd ?? -1) || (b.mcapUsd ?? -1) - (a.mcapUsd ?? -1);
+const off = (v) => v === "0" || v === "false"; // an opt-out query flag (`?children=0`)
 
 /** Trades → OHLC candles of `res` seconds; USD when every trade has a USD price, else quote units. */
 export function buildCandles(trades, res) {
@@ -109,6 +110,7 @@ export function healthOf({ model, indexer, hub, images, meta, metahost, treasury
     indexer: { phase: snap.phase ?? null, lagS, lastRefreshAt: snap.lastRefreshAt ?? null, lastError: snap.lastError ?? null, backfill: { ...model.backfill }, created: snap.created ?? null, map: snap.map ?? null },
     map: { ...(model.mapStats ?? {}), total: model.mapCache?.total ?? null, cachedVersion: model.mapCache?.version ?? null, dirty: model.dirty?.size ?? 0 },
     ws: ws ? { connected: ws.connected, lastMessageAgoMs: ws.lastMessageAgoMs, connects: ws.connects, errors: ws.errors, backoffMs: ws.backoffMs ?? null, reconnecting: !!ws.reconnecting } : null,
+    activity: model.activity ? { ...model.activity.size(), seededMs: model.activity.seededMs ?? null } : null,
     rpc: rpc?.snapshot?.() ?? snap.rpc ?? null, rpcLanes: rpc?.laneSnapshot?.() ?? null, meta: meta?.snapshot?.() ?? meta?.stats ?? snap.meta ?? null, images: images?.stats ?? null,
     metahost: metahost ? { ...metahost.stats, quota: metahost.quota?.snapshot?.() ?? null } : null, treasury: treasury?.stats ?? null,
     sse: hub?.clients?.size ?? 0, sseStats: hub?.stats ?? null, solUsd: model.solUsd, memoryMb: { rss: Math.round(mem.rss / 1e6), heap: Math.round(mem.heapUsed / 1e6) },
@@ -179,9 +181,12 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
     model.touch(mint);
     const uri = model.mint(mint)?.uri; if (uri) meta?.request(uri, { front: true });
     // In ours mode only our children are listed; `otherChildren` says how many pump.fun leaves out.
+    // `children=0` / `trades=0` keep the shape but leave those lists empty: the map's side panel
+    // needs only the coin, and a big root's children cost a view() each (~0.5 MB for the largest).
     const coin = view(c);
-    const children = model.visibleChildren(mint).map(view).sort(byLocked);
-    sendCachedJson(req, res, { coin, children, otherChildren: coin.otherChildren, trades: model.db.tradesFor(mint, 50) }, { maxAge: 3 });
+    const children = off(req.query.children) ? [] : model.visibleChildren(mint).map(view).sort(byLocked);
+    const trades = off(req.query.trades) ? [] : model.db.tradesFor(mint, 50);
+    sendCachedJson(req, res, { coin, children, otherChildren: coin.otherChildren, trades }, { maxAge: 3 });
   }));
 
   app.get("/api/tree/:mint", (req, res) => {
@@ -231,11 +236,28 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
     sendCachedJson(req, res, { roots: roots.map((r) => node(r, depth)), scope: all ? "all" : model.mode }, { maxAge: 10 });
   });
 
+  // Per-mint trade activity for the map (DESIGN §11.5 "Activity (heat)"): trades in the last hour and
+  // day, 24 h USD volume, buys in the last hour and the last trade's time, as parallel arrays over
+  // every tracked coin with a trade in 24 h, whatever SHOW (the map is the all-scope surface). A
+  // sidecar rather than part of /api/map: it decays with the clock without any row changing, so it
+  // cannot ride on `since=`. Built from the in-memory counters at most every 15 s.
+  app.get("/api/map/heat", (req, res) => {
+    const entry = model.heatEntry();
+    if (!entry.prepared) { const t0 = performance.now(); entry.prepared = prepareJson(entry.body); entry.encodeMs = Math.round(performance.now() - t0); }
+    res.setHeader("x-heat-build-ms", String(entry.buildMs ?? 0));
+    if (entry.encodeMs != null) res.setHeader("x-heat-encode-ms", String(entry.encodeMs));
+    return sendPrepared(req, res, entry.prepared, { maxAge: 15 });
+  });
+
+  // `scope=all` opens the chart of any tracked coin to the map's side panel (the map shows every
+  // pump.fun pair, DESIGN §11.5); without it, ours mode keeps charts to our coins and their ancestors.
   app.get("/api/candles/:mint", (req, res) => {
     const { mint } = req.params;
     if (!isMint(mint)) return res.status(400).json({ error: "invalid mint" });
-    if (!model.get(mint)) return res.status(404).json({ error: "unknown mint" });
-    if (!model.inScope(mint)) return res.status(404).json({ error: "not a Spore coin" }); // ours mode: charts only for our coins and their ancestors
+    const c = model.get(mint);
+    if (!c) return res.status(404).json({ error: "unknown mint" });
+    if (req.query.scope === "all") { if (!c.tracked) return res.status(404).json({ error: "not tracked" }); }
+    else if (!model.inScope(mint)) return res.status(404).json({ error: "not a Spore coin" }); // ours mode: charts only for our coins and their ancestors
     const resSec = clampInt(req.query.res, 60, 15, 86_400);
     const trades = model.db.tradesSince(mint, nowS() - resSec * 500);
     sendCachedJson(req, res, buildCandles(trades, resSec), { maxAge: 5 });

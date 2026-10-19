@@ -64,12 +64,31 @@ export function applyDelta(set: NodeSet, entries: MapDeltaEntry[]): BubbleNode[]
 }
 
 /// `pair`: the child, and its parent when the map does not hold it yet (a root seen for the first time).
+/// Every ancestor the set holds counts the newcomers at once (the direct parent's `children` too), so a
+/// root's descendant count is right before the next `mapdelta` carries the server's numbers.
 export function applyPair(set: NodeSet, p: PairEvent): BubbleNode[] {
   const out: BubbleNode[] = [];
-  const parent = p.parent?.mint ? set.get(p.parent.mint) : undefined;
-  if (p.parent?.mint && !parent) out.push(fromMapCoin(p.parent, p.parent.parentMint ?? null));
-  else if (parent && p.coin.mint && !set.has(p.coin.mint)) out.push({ ...parent, children: parent.children + 1, descendants: (parent.descendants ?? 0) + 1 });
-  out.push(fromMapCoin(p.coin, p.parent?.mint ?? p.coin.parentMint ?? null));
+  const parentMint = p.parent?.mint ?? p.coin.parentMint ?? null;
+  const parent = parentMint ? set.get(parentMint) : undefined;
+  const childIsNew = !!p.coin.mint && !set.has(p.coin.mint);
+  // `added` nodes join the subtree of `anc`; `anc` is their nearest ancestor already in the set
+  let added = childIsNew ? 1 : 0;
+  let anc: BubbleNode | undefined = parent;
+  if (p.parent?.mint && !parent) {
+    out.push(fromMapCoin(p.parent, p.parent.parentMint ?? null));
+    added++;
+    anc = p.parent.parentMint ? set.get(p.parent.parentMint) : undefined;
+  }
+  if (added && anc) {
+    const seen = new Set<string>();
+    for (let cur: BubbleNode | undefined = anc, first = true, hops = 0; cur && !seen.has(cur.mint) && hops < 32; hops++, first = false) {
+      seen.add(cur.mint);
+      // the direct parent of the topmost newcomer gains a child; everything above only descendants
+      out.push({ ...cur, children: cur.children + (first ? 1 : 0), descendants: (cur.descendants ?? 0) + added });
+      cur = cur.parentMint ? set.get(cur.parentMint) : undefined;
+    }
+  }
+  out.push(fromMapCoin(p.coin, parentMint));
   return upsert(set, out);
 }
 

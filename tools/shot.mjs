@@ -1,7 +1,7 @@
 // Full-page screenshots of the running site through headless Chrome's DevTools protocol (no
 // puppeteer, no download). Usage: node tools/shot.mjs <url> <out.png> [width] [height] [waitMs]
 import { spawn } from "node:child_process";
-import { writeFileSync, mkdtempSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,4 +37,11 @@ try {
   const errors = await send("Runtime.evaluate", { expression: "JSON.stringify({title: document.title, h: document.documentElement.scrollHeight, w: document.documentElement.scrollWidth, overflowX: document.documentElement.scrollWidth > window.innerWidth})", returnByValue: true }, sessionId);
   console.log(`${out} ${w}x${height} ${errors.result.value}`);
   ws.close();
-} finally { chrome.kill("SIGKILL"); }
+} finally {
+  // Chrome keeps writing to its profile for a moment after SIGKILL reaches it: wait for the exit,
+  // then retry the delete, so no spore-shot-* directory is left behind.
+  const exited = new Promise((r) => { if (chrome.exitCode !== null || chrome.signalCode !== null) r(); else { chrome.once("exit", () => r()); setTimeout(r, 3000); } });
+  chrome.kill("SIGKILL");
+  await exited;
+  for (let i = 0; i < 10; i++) { try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); break; } catch { await sleep(300); } }
+}

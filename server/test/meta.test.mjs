@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082", "hex");
-import { isAllowedImageUrl, isAllowedMetaUrl, normalizeImageUrl, pickMeta, ImageCache, MetaFetcher, HostPacer, gatewayCandidates, ipfsPathOf, imageProxyUrl, retryAfterS, META_TTL_S, HOST_SPACING_MS } from "../lib/meta.mjs";
+import { isAllowedImageUrl, isAllowedMetaUrl, normalizeImageUrl, pickMeta, ImageCache, MetaFetcher, HostPacer, gatewayCandidates, ipfsPathOf, imageProxyUrl, retryAfterS, META_TTL_S, HOST_SPACING_MS, META_IMAGE_RULE } from "../lib/meta.mjs";
+import { buildTree } from "./helpers/tree.mjs";
 
 test("image hosts: any public https host at the default port passes; local, numeric, non-https, credentials and ports are refused", () => {
   for (const ok of [
@@ -238,4 +239,63 @@ test("MetaFetcher: a rate-limited URI is requeued, not recorded as a failure", a
   assert.equal(f.stats.rateLimited, 1);
   assert.equal(f.attempts.get("https://m.rapidlaunch.io/m/x"), 1);
   f.stop();
+});
+
+test("image re-check (META_IMAGE_RULE): resolved rows without an image are due once, gated by kv; rows with an image are never refetched", async () => {
+  const { db, model } = buildTree();
+  const nowS = Math.floor(Date.now() / 1000);
+  const row = (image, extra = {}) => ({ image, description: null, twitter: null, telegram: null, website: null, fetchedAt: nowS, ok: true, ...extra });
+  const U = (s) => `https://ipfs.io/ipfs/${s}`;
+  model.setMeta(U("ROOT"), row(null));                               // resolved under the old rule, no logo
+  model.setMeta(U("AAA"), row("https://ipfs.io/ipfs/imgA"));         // has a logo
+  model.setMeta(U("BBB"), row(null, { ok: false, error: "HTTP 404", attempts: 1 })); // a failure keeps its own backoff
+  // GGG has no row at all (always due).
+  const logs = [];
+  const log = { info: (m) => logs.push(m), warn() {} };
+  const calls = [];
+  const fetchImpl = async (url) => { calls.push(url); return new Response(JSON.stringify({ image: "https://cdn.example-launchpad.io/root.png" }), { headers: { "content-type": "application/json" } }); };
+  const pacer = () => new HostPacer({ fetchImpl, sleep: async () => {} });
+
+  // First boot (no workers, so the queue can be read before anything is fetched).
+  const f = new MetaFetcher(model, { concurrency: 0, pacer: pacer(), log });
+  f.start({ sweepMs: 3_600_000 }); f.stop();
+  assert.ok(logs.includes("meta: image recheck queued 1"), logs.join("\n"));
+  assert.deepEqual([...f.recheck], [U("ROOT")]);
+  assert.equal(db.kvGet("metaImageRule"), META_IMAGE_RULE);
+  assert.equal(f.needsFetch(U("ROOT")), true, "due whatever its age");
+  assert.equal(f.needsFetch(U("AAA")), false, "a row with an image is not touched");
+  assert.equal(f.needsFetch(U("BBB")), false, "a failed row waits for its retry window");
+  const queued = f.queue.slice(f.head);
+  assert.equal(queued[0], U("ROOT"), "the sweep's order: largest locked value first");
+  assert.ok(queued.includes(U("GGG")));
+  assert.ok(!queued.includes(U("AAA")) && !queued.includes(U("BBB")));
+  assert.equal(f.snapshot().run.recheck, 1);
+
+  // Second boot on the same database: the rule is recorded, nothing is queued again.
+  logs.length = 0;
+  const f2 = new MetaFetcher(model, { concurrency: 0, pacer: pacer(), log });
+  assert.equal(f2.queueImageRecheck(), 0);
+  assert.equal(f2.recheck.size, 0);
+  assert.ok(!logs.some((m) => m.includes("recheck")));
+  assert.equal(f2.needsFetch(U("ROOT")), false, "back to the regular TTL");
+
+  // With workers: the re-checked uri is fetched once, gets its logo and leaves the set; AAA is never asked for.
+  db.kvSet("metaImageRule", 1);
+  const f3 = new MetaFetcher(model, { concurrency: 2, pacer: pacer(), log });
+  f3.start({ sweepMs: 3_600_000 });
+  await new Promise((r) => setTimeout(r, 50));
+  f3.stop();
+  assert.equal(f3.recheck.size, 0, "a uri leaves the set once fetched");
+  assert.equal(model.meta.get(U("ROOT")).image, "https://cdn.example-launchpad.io/root.png");
+  assert.equal(f3.needsFetch(U("ROOT")), false);
+  assert.ok(calls.some((c) => c.endsWith("/ipfs/ROOT")));
+  assert.ok(!calls.some((c) => c.endsWith("/ipfs/AAA")), "rows that had an image are never refetched by the re-check");
+  assert.ok(!calls.some((c) => c.endsWith("/ipfs/BBB")));
+
+  // A model without a database (unit tests, tools) has nothing to gate on: no re-check, no throw.
+  const bare = new MetaFetcher({ meta: new Map([["https://ipfs.io/ipfs/x", row(null)]]) }, { concurrency: 0, pacer: pacer(), log });
+  assert.equal(bare.queueImageRecheck(), 0);
+  bare.start(); bare.stop();
+  assert.equal(bare.recheck.size, 0);
+  db.close();
 });

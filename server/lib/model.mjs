@@ -7,6 +7,7 @@
 import { USDC_MINT, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "./sdk.mjs";
 import { priceQuoteOf, chainPrices, progressOf, units } from "./pricing.mjs";
 import { imageProxyUrl } from "./meta.mjs";
+import { Activity } from "./activity.mjs";
 
 const nowS = () => Math.floor(Date.now() / 1000);
 const SOL_DECIMALS = 9;
@@ -24,6 +25,9 @@ export const PENDING_MAX = 500;
 // The whole-forest map (DESIGN §11.5) is rebuilt at most once per this window, and only when the
 // model version moved; the delta variant (`since=`) shares the window.
 export const MAP_CACHE_MS = 10_000;
+// The map's heat sidecar (`/api/map/heat`, DESIGN §11.5) is rebuilt at most once per this window:
+// it decays with the clock, not with model versions, so it has no version key.
+export const HEAT_CACHE_MS = 15_000;
 // Coin fields whose change alters a map node or the coin page; bookkeeping stamps are left out so
 // a refresh tick that re-reads an unchanged curve does not mark the coin as updated.
 // `creatorFee` (fees accrued on the curve, read by the treasury) lives in memory only and moves
@@ -54,7 +58,19 @@ export class Model {
     this.global = null;             // decoded pump Global (plain)
     this.backfill = { done: false, total: 0, resolved: 0 };
     this.version = 0; this.derivedVersion = -1; this.derived = new Map();
-    this.volCache = new Map(); this.volCacheAt = 0;
+    // `computed()` runs after every version bump (each live trade is one), so its per-coin inputs are
+    // memoized: a coin object is never mutated once indexed (upsertCoin builds a new one), so its
+    // quote price and the value it locks in its parent are cached by object identity; descendant
+    // counts change only when the parent → child structure does (`structVersion`).
+    this.pqMemo = new WeakMap();    // coin → { pq, bd, qd, dv }: dv = `decVersion` the decimals were read at
+    this.decVersion = 0;            // moves when any mint's decimals change
+    this.lockMemo = new WeakMap();  // coin → bigint it locks in its parent
+    this.structVersion = 0; this.descVersion = -1; this.descCache = new Map();
+    // Exact 24 h / 1 h trade counters per mint, seeded from sqlite at load and fed by recordTrade.
+    // They include trades the 2 000-rows-per-mint SQL trim later deletes (db.insertTrade), so a mint
+    // with more than 2 000 trades in 24 h can exceed a SQL recount until the next restart re-seeds.
+    this.activity = new Activity({ now: () => Math.floor(this.now() / 1000) });
+    this.heatCache = null;
     this.touched = new Map();       // mint → last API access (ms); the refresh loop prioritises these
     this.updatedAt = nowS();
     // Map delta-sync (DESIGN §11.5): coins whose node changed since the last `mapdelta` flush, the
@@ -69,14 +85,19 @@ export class Model {
 
   load() {
     for (const m of this.db.allMints()) { this.mints.set(m.mint, m); this.#indexUri(m.mint, null, m.uri); }
+    this.decVersion++;
     for (const m of this.db.allMeta()) { this.meta.set(m.uri, m); if (m.image) this.imageUrls.add(m.image); }
     for (const c of this.db.allCoins()) this.#index(c);
     this.solUsd = this.db.kvGet("solUsd"); this.solUsdAt = this.db.kvGet("solUsdAt", 0);
     this.quoteUsd = new Map(Object.entries(this.db.kvGet("quoteUsd", {})));
     this.global = this.db.kvGet("global");
     this.pending = new Map(Object.entries(this.db.kvGet("oursPending", {})));
+    const t0 = performance.now();
+    const seeded = this.activity.seed(this.db.tradesWindow(Math.floor(this.now() / 1000) - this.activity.dayS));
+    this.activity.seededMs = Math.round(performance.now() - t0);
     this.#bump();
     this.log.info?.(`model: ${this.coins.size} coins, ${this.mints.size} mints, ${this.meta.size} metadata entries loaded`);
+    this.log.info?.(`activity seeded ${seeded} trades in ${this.activity.seededMs} ms`);
   }
 
   #bump() { this.version++; this.updatedAt = nowS(); }
@@ -107,6 +128,7 @@ export class Model {
   #index(c) {
     const prev = this.coins.get(c.mint);
     if (prev && prev.quoteMint !== c.quoteMint) this.children.get(prev.quoteMint)?.delete(c.mint);
+    if (!prev || prev.quoteMint !== c.quoteMint || prev.tracked !== c.tracked) this.structVersion++;
     this.coins.set(c.mint, c);
     if (c.quoteMint) { if (!this.children.has(c.quoteMint)) this.children.set(c.quoteMint, new Set()); this.children.get(c.quoteMint).add(c.mint); }
     if (c.curve) this.curves.set(c.curve, c.mint);
@@ -170,7 +192,7 @@ export class Model {
       this.touched.delete(c.mint);
       n++;
     }
-    if (n) this.#bump();
+    if (n) { this.structVersion++; this.#bump(); }
     return n;
   }
   /** Forgets API views older than `maxAgeMs`: the refresh loop only reads newer ones, so older entries are dead weight. */
@@ -182,6 +204,7 @@ export class Model {
     const prev = this.mints.get(info.mint) ?? { mint: info.mint, decimals: null, tokenProgram: null, supply: null, name: null, symbol: null, uri: null, onchainAt: 0 };
     const m = { ...prev, ...stripUndefined(info) };
     this.mints.set(m.mint, m);
+    if (prev.decimals !== m.decimals) this.decVersion++;
     this.#indexUri(m.mint, prev.uri, m.uri);
     this.db.upsertMint(m);
     // A name, ticker or metadata pointer that just resolved changes the coin's label on the map.
@@ -235,7 +258,8 @@ export class Model {
   }
   setGlobal(g) { this.global = g; this.db.kvSet("global", g); this.#bump(); }
   setBackfill(b) { this.backfill = { ...this.backfill, ...b }; }
-  recordTrade(t) { this.db.insertTrade(t); this.volCacheAt = 0; this.#bump(); }
+  /** Stores a trade; only a row sqlite did not have yet is counted (a replayed event never counts twice). */
+  recordTrade(t) { if (this.db.insertTrade(t)) this.activity.record(t); this.#bump(); }
   touch(mint) { this.touched.set(mint, Date.now()); }
 
   // ---------------------------------------------------------------- "ours" (DESIGN §11.1)
@@ -369,46 +393,76 @@ export class Model {
   computed() {
     if (this.derivedVersion === this.version) return this.derived;
     const d = new Map();
-    const priceOf = (c) => { const e = d.get(c.mint); return e ? e.priceQuote : null; };
     for (const c of this.coins.values()) {
-      d.set(c.mint, { priceQuote: priceQuoteOf(c, this.decimalsOf(c.mint), this.quoteDecimals(c)), priceSol: null, priceUsd: null, lockedQuote: 0n, lockedUsd: null, descendants: 0, children: 0 });
+      let m = this.pqMemo.get(c);
+      if (!m || m.dv !== this.decVersion) {
+        const bd = this.decimalsOf(c.mint), qd = this.quoteDecimals(c);
+        if (!m || m.bd !== bd || m.qd !== qd) { m = { pq: priceQuoteOf(c, bd, qd), bd, qd, dv: 0 }; this.pqMemo.set(c, m); }
+        m.dv = this.decVersion;
+      }
+      d.set(c.mint, { priceQuote: m.pq, priceSol: null, priceUsd: null, lockedQuote: 0n, lockedUsd: null, descendants: 0, children: 0 });
     }
+    // Self first, then the ancestors as far as the model knows them (the walk `ancestors()` does,
+    // cycle-safe), into two scratch arrays reused for every coin.
+    const chain = [], steps = [];
     for (const c of this.coins.values()) {
-      const chain = [c, ...this.ancestors(c.mint)];
+      chain.length = 0; chain.push(c);
+      for (let x = c; x.quoteMint && !inChain(chain, x.quoteMint);) { const p = this.coins.get(x.quoteMint); if (!p) break; chain.push(p); x = p; }
       const root = chain[chain.length - 1];
-      const e = d.get(c.mint);
       // A chain that does not reach a depth-0 coin cannot be priced in SOL or USD yet (ancestor missing).
       if (root.depth !== 0) continue;
+      steps.length = chain.length;
+      for (let k = 0; k < chain.length; k++) steps[k] = d.get(chain[k].mint).priceQuote;
       const kind = this.rootQuoteKind(root);
-      Object.assign(e, chainPrices(chain.map(priceOf), kind, this.solUsd, kind === "other" ? this.quoteUsd.get(root.quoteMint) ?? null : null));
+      Object.assign(d.get(c.mint), chainPrices(steps, kind, this.solUsd, kind === "other" ? this.quoteUsd.get(root.quoteMint) ?? null : null));
     }
     // Locked quote = Σ children (raw units of the parent's token: realQuoteReserves on the curve, the
     // pool's quote vault after migration). Descendants = recursive child count, children = direct.
     for (const [parent, set] of this.children) {
       const e = d.get(parent); if (!e) continue;
       let locked = 0n, n = 0;
-      for (const m of set) { const ch = this.coins.get(m); if (!ch || !ch.tracked) continue; n++; locked += BigInt((ch.migrated ? ch.poolQuote : ch.realQuoteReserves) ?? 0); }
+      for (const m of set) {
+        const ch = this.coins.get(m); if (!ch || !ch.tracked) continue;
+        n++;
+        let v = this.lockMemo.get(ch);
+        if (v === undefined) { v = BigInt((ch.migrated ? ch.poolQuote : ch.realQuoteReserves) ?? 0); this.lockMemo.set(ch, v); }
+        locked += v;
+      }
       e.children = n; e.lockedQuote = locked;
       const parentCoin = this.coins.get(parent);
       e.lockedUsd = e.priceUsd != null && parentCoin ? units(locked, this.decimalsOf(parent)) * e.priceUsd : null;
     }
-    const memo = new Map(); const visiting = new Set();
-    const desc = (mint) => {
-      if (memo.has(mint)) return memo.get(mint);
-      if (visiting.has(mint)) return 0; // malformed data guard; depth strictly grows on chain
-      visiting.add(mint);
-      let n = 0;
-      for (const m of this.children.get(mint) ?? []) { const ch = this.coins.get(m); if (ch && ch.tracked) n += 1 + desc(m); }
-      visiting.delete(mint); memo.set(mint, n); return n;
-    };
-    for (const c of this.coins.values()) d.get(c.mint).descendants = desc(c.mint);
+    if (this.descVersion !== this.structVersion) {
+      const memo = new Map(); const visiting = new Set();
+      const desc = (mint) => {
+        if (memo.has(mint)) return memo.get(mint);
+        if (visiting.has(mint)) return 0; // malformed data guard; depth strictly grows on chain
+        visiting.add(mint);
+        let n = 0;
+        for (const m of this.children.get(mint) ?? []) { const ch = this.coins.get(m); if (ch && ch.tracked) n += 1 + desc(m); }
+        visiting.delete(mint); memo.set(mint, n); return n;
+      };
+      for (const c of this.coins.values()) desc(c.mint);
+      this.descCache = memo; this.descVersion = this.structVersion;
+    }
+    for (const [mint, e] of d) e.descendants = this.descCache.get(mint) ?? 0;
     this.derived = d; this.derivedVersion = this.version;
     return d;
   }
-  /** 24 h volume/trade counts per mint, from sqlite, cached for 10 s and invalidated by every new trade. */
-  volumes() {
-    if (Date.now() - this.volCacheAt > 10_000) { this.volCache = this.db.volume24hAll(); this.volCacheAt = Date.now(); }
-    return this.volCache;
+  /** 24 h volume/trade counts per mint (Map<mint, { trades, usd }>), live from the in-memory activity counters. */
+  volumes() { return this.activity.volumes(); }
+  /**
+   * The map's heat sidecar (DESIGN §11.5): per-mint activity of every tracked coin with a trade in the
+   * last 24 h, whatever the listing mode. Rebuilt at most once per `HEAT_CACHE_MS`; the entry carries
+   * a `prepared` slot the HTTP layer fills with the encoded bytes, like `mapAll`.
+   */
+  heatEntry() {
+    const hit = this.heatCache;
+    if (hit && this.now() - hit.at < HEAT_CACHE_MS) return hit;
+    const t0 = performance.now();
+    const body = this.activity.heat({ keep: (mint) => !!this.coins.get(mint)?.tracked });
+    this.heatCache = { at: this.now(), body, prepared: null, buildMs: Math.round(performance.now() - t0) };
+    return this.heatCache;
   }
 
   // ---------------------------------------------------------------- API views (DESIGN §7)
@@ -546,4 +600,5 @@ export class Model {
   }
 }
 
+function inChain(chain, mint) { for (let i = 0; i < chain.length; i++) if (chain[i].mint === mint) return true; return false; }
 function stripUndefined(o) { return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)); }

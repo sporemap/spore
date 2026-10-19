@@ -5,6 +5,11 @@
 // and a full reload) to time the warm cache, screenshots 1440 and 390 wide, and fails on any console or
 // CSP error. `--prod <url>` instead loads a production build (no mock) and only checks errors + worker.
 //
+// Map v2 phases (renderer): cluster titles at fit (1440 and 390), Spore beacons at fit, retained heap
+// growth over 10 s idle, a 40-notch wheel gesture into the largest cluster, a 300-trade burst through
+// the EventSource mock (half of them routed child → parent buys), the 'min1k' and 'ours' highlights,
+// and a camera flight to a far coin sampled every animation frame. Screenshots at k = 0.15/0.6/1.5/3.
+//
 //   node --import tsx test/map-perf.mts [--url http://127.0.0.1:5231] [--stress 20000] [--roots all] [--shots DIR]
 //   node --import tsx test/map-perf.mts --prod http://127.0.0.1:8793
 import { spawn } from "node:child_process";
@@ -19,7 +24,7 @@ const PROD = opt("--prod");
 const STRESS = Number(opt("--stress", "0"));
 const ROOTS = opt("--roots", "all")!;
 const SHOTS = opt("--shots", process.env.SHOT_DIR ?? join(process.env.SPORE_TMP ?? tmpdir(), "spore-map-shots"))!;
-const BUDGET = { settled: 16, settling: 33, firstPaintCold: 2000, firstPaintWarm: 500 };
+const BUDGET = { settled: 16, settling: 33, firstPaintCold: 2000, firstPaintWarm: 500, gestureP95: 16, gestureMax: 33, flightMs: 1900, flightKRatio: 1.15, heapGrowthMB: 2 };
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const W = 1440, H = 900;
 
@@ -40,7 +45,7 @@ const check = (cond: boolean, msg: string) => { if (!cond) fails.push(msg); };
 const MOCK_ES = `(() => {
   const list = []; window.__es = list;
   class MockES {
-    constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; this.onopen = null; this.onerror = null; this.onmessage = null; list.push(this); setTimeout(() => { this.readyState = 1; if (this.onopen) this.onopen(new Event("open")); }, 0); }
+    constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; this.onopen = null; this.onerror = null; this.onmessage = null; list.push(this); setTimeout(() => { if (this.readyState !== 0) return; this.readyState = 1; if (this.onopen) this.onopen(new Event("open")); }, 0); }
     addEventListener(t, f) { (this.listeners[t] ||= []).push(f); }
     removeEventListener(t, f) { this.listeners[t] = (this.listeners[t] || []).filter((g) => g !== f); }
     close() { this.readyState = 2; }
@@ -59,7 +64,7 @@ try {
   let id = 0; const pending = new Map<number, { res: (v: unknown) => void; rej: (e: Error) => void }>();
   ws.onmessage = (ev) => {
     const m = JSON.parse(String(ev.data)) as Msg;
-    if (m.id && pending.has(m.id)) { const { res, rej } = pending.get(m.id)!; pending.delete(m.id); m.error ? rej(new Error(m.error.message)) : res(m.result); return; }
+    if (m.id && pending.has(m.id)) { const { res, rej } = pending.get(m.id)!; pending.delete(m.id); if (m.error) rej(new Error(m.error.message)); else res(m.result); return; }
     if (m.method === "Runtime.consoleAPICalled") { const p = m.params as { type: string; args: { value?: unknown; description?: string }[] }; if (p.type === "error") errors.push(`console.error: ${p.args.map((a) => a.value ?? a.description ?? "").join(" ")}`); }
     if (m.method === "Runtime.exceptionThrown") { const p = m.params as { exceptionDetails: { text: string; exception?: { description?: string } } }; errors.push(`exception: ${p.exceptionDetails.exception?.description ?? p.exceptionDetails.text}`); }
     if (m.method === "Log.entryAdded") { const p = m.params as { entry: { level: string; source: string; text: string; url?: string } }; if (p.entry.level === "error") { if (p.entry.source === "network") netErrors.push(`${p.entry.text} ${p.entry.url ?? ""}`); else errors.push(`${p.entry.source}: ${p.entry.text}`); } }
@@ -108,6 +113,7 @@ try {
     check(fs.settled.avg <= BUDGET.settled, `settled avg ${fs.settled.avg.toFixed(1)} ms > ${BUDGET.settled}`);
     check(fs.settled.p95 <= BUDGET.settled * 1.5, `settled p95 ${fs.settled.p95.toFixed(1)} ms > ${BUDGET.settled * 1.5}`);
     result.shot1440 = await shot(`map-1440${STRESS ? `-stress${STRESS}` : ""}.png`);
+    if (!STRESS) await v2Phases();
     // labels: every bubble ≥ 9 px gets one, so zoom into the biggest root and count them there; logos load lazily there too
     const bigRoot = await evalJs<string | null>("__sporeMap.anyRoot()");
     await evalJs(`__sporeMap.zoomTo(${JSON.stringify(bigRoot)}, 1.4)`);
@@ -154,9 +160,162 @@ try {
     await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }, S);
     await sleep(1500);
     result.shot390 = await shot(`map-390${STRESS ? `-stress${STRESS}` : ""}.png`);
+    if (!STRESS) {
+      // phone: titles at fit (the camera re-fits for the new viewport)
+      await evalJs("__sporeMap.fit()");
+      await waitFor("!__sporeMap.flying()", 5000, "phone fit flight").catch(() => {});
+      await sleep(600);
+      const top = await evalJs<{ root: string }[]>("__sporeMap.clusters(10)");
+      const titled = await evalJs<string[]>("__sporeMap.titles()");
+      const hits = top.filter((c) => titled.includes(c.root)).length;
+      result.titles390 = { titled: titled.length, top10: hits };
+      check(hits >= 4, `390 px fit: only ${hits} of the 10 largest clusters titled (need 4)`);
+      result.shot390fit = await shot("map-390-fit.png");
+    }
     result.phone = await evalJs(`JSON.stringify({ overflowX: document.documentElement.scrollWidth > window.innerWidth, tools: !!document.querySelector(".map-tools"), labels: __sporeMap.labels(), drawn: __sporeMap.drawn() })`).then((s) => JSON.parse(s as unknown as string));
   }
   ws.close();
+
+  async function v2Phases() {
+    const stats = () => evalJs<{ settling: { n: number; avg: number; p95: number; max: number }; settled: { n: number; avg: number; p95: number; max: number } }>("__sporeMap.frameStats()");
+    const render = () => evalJs<{ titles: number; fx: number; built: number; beacons: number } | null>("(() => { const p = window.__sporeRender; return p ? { titles: p.titles, fx: p.fx, built: p.built, beacons: p.beacons } : null; })()");
+    const toFit = async () => { await evalJs("__sporeMap.fit()"); await waitFor("!__sporeMap.flying()", 5000, "fit flight to land").catch(() => fails.push("fit flight did not land in 5 s")); await sleep(500); };
+    const round = (v: number) => Math.round(v * 100) / 100;
+    await toFit();
+    // ---- titles at fit: the largest trees are named at overview zoom
+    const top = await evalJs<{ root: string; count: number; title: string }[]>("__sporeMap.clusters(10)");
+    const titled = await evalJs<string[]>("__sporeMap.titles()");
+    const hits = top.filter((c) => titled.includes(c.root));
+    result.titles1440 = { titled: titled.length, top10: hits.length, missing: top.filter((c) => !titled.includes(c.root)).map((c) => c.title) };
+    check(hits.length >= 8, `fit 1440: only ${hits.length} of the 10 largest clusters titled (need 8): missing ${top.filter((c) => !titled.includes(c.root)).map((c) => c.title).join(", ")}`);
+    // ---- Spore beacons: every launch on screen at fit is a ringed beacon
+    const ours = await evalJs<number>("(() => { const m = __sporeMap.testHighlight('ours'); __sporeMap.testHighlight(null); return m; })()");
+    await sleep(300);
+    const r0 = await render();
+    result.beacons = { onScreen: ours, drawn: r0?.beacons ?? null };
+    check(r0 != null && r0.beacons === ours, `beacons at fit: drew ${r0?.beacons} for ${ours} Spore launches`);
+    // ---- heap: retained growth over 10 s idle at fit (GC before both reads)
+    await send("Performance.enable", {}, S); await send("HeapProfiler.enable", {}, S);
+    const heap = async () => { await send("HeapProfiler.collectGarbage", {}, S); const m = (await send("Performance.getMetrics", {}, S)) as { metrics: { name: string; value: number }[] }; return (m.metrics.find((x) => x.name === "JSHeapUsedSize")?.value ?? 0) / 1e6; };
+    const h0 = await heap(); await sleep(10_000); const h1 = await heap();
+    await send("HeapProfiler.disable", {}, S); await send("Performance.disable", {}, S); // leave the page as fast as it was
+    result.heapMB = { before: round(h0), after: round(h1), growth: round(h1 - h0) };
+    check(h1 - h0 < BUDGET.heapGrowthMB, `heap grew ${(h1 - h0).toFixed(2)} MB over 10 s idle (budget ${BUDGET.heapGrowthMB})`);
+    // ---- gesture: 40 wheel notches into the largest cluster's centre
+    const big = await evalJs<{ root: string; x: number; y: number }>(`(() => { const c = __sporeMap.clusters(1)[0]; const cam = __sporeMap.camera(); const b = document.querySelector(".bm-canvas").getBoundingClientRect(); return { root: c.root, x: Math.round(b.left + c.cx * cam.k + cam.x), y: Math.round(b.top + c.cy * cam.k + cam.y) }; })()`);
+    const under = await evalJs<string | null>(`__sporeMap.clusterAt(${big.x}, ${big.y})`);
+    await evalJs("__sporeMap.resetFrames()");
+    for (let q = 0; q < 40; q++) { await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: big.x, y: big.y, deltaX: 0, deltaY: -120 }, S); await sleep(30); }
+    await sleep(400);
+    const g = await stats();
+    const gMax = Math.max(g.settled.max, g.settling.max);
+    result.gesture = { at: big, clusterAt: under, k: await evalJs<number>("__sporeMap.zoom()"), settled: g.settled, settling: g.settling };
+    check(g.settled.p95 <= BUDGET.gestureP95, `gesture settled p95 ${g.settled.p95.toFixed(1)} ms > ${BUDGET.gestureP95}`);
+    check(gMax <= BUDGET.gestureMax, `gesture max frame ${gMax.toFixed(1)} ms > ${BUDGET.gestureMax}`);
+    result.shotGesture = await shot("map-1440-gesture-k6.png");
+    // ---- zoom ladder screenshots on the largest tree (hulls must be gone at k ≥ 1.6)
+    for (const k of [0.15, 0.6, 1.5, 3]) {
+      await evalJs(`__sporeMap.zoomTo(${JSON.stringify(big.root)}, ${k})`);
+      await sleep(1400);
+      await shot(`map-1440-k${k}.png`);
+    }
+    // ---- trade burst: 300 trades in 3 s, half of them same-signature child → parent buys
+    await evalJs(`__sporeMap.zoomTo(${JSON.stringify(big.root)}, 0.6)`);
+    await sleep(1200);
+    await evalJs("__sporeMap.resetFrames()");
+    await evalJs(`(() => {
+      const pairs = __sporeMap.sample(150);
+      const lu = () => Math.exp(Math.log(5) + Math.random() * (Math.log(2000) - Math.log(5)));
+      const ev = [];
+      for (let q = 0; q < 75; q++) { const p = pairs[q % pairs.length], sig = "burst" + q + Math.random().toString(36).slice(2), v = lu(), legs = [{ sig, mint: p.mint, isBuy: true, valueUsd: v }, { sig, mint: p.parent, isBuy: true, valueUsd: v }]; if (q % 2) legs.reverse(); ev.push(legs); }
+      for (let q = 0; q < 150; q++) { const p = pairs[(q * 7 + 3) % pairs.length]; ev.push([{ sig: "single" + q + Math.random().toString(36).slice(2), mint: q % 2 ? p.mint : p.parent, isBuy: Math.random() < 0.55, valueUsd: lu() }]); }
+      for (let q = ev.length - 1; q > 0; q--) { const j = Math.floor(Math.random() * (q + 1)); [ev[q], ev[j]] = [ev[j], ev[q]]; }
+      const flat = ev.flat();
+      const es = (window.__es || []).filter((e) => e.readyState !== 2);
+      window.__burst = { fx: [], done: false, n: flat.length };
+      let i = 0;
+      const t0 = performance.now();
+      const tick = () => {
+        const due = Math.min(flat.length, Math.ceil((performance.now() - t0) / 10));
+        for (; i < due; i++) { const t = flat[i]; const payload = JSON.stringify({ sig: t.sig, mint: t.mint, slot: 0, time: Math.floor(Date.now() / 1000), isBuy: t.isBuy, user: "burst", baseAmount: 1, quoteAmount: 1, priceQuote: 1, priceUsd: 1, valueUsd: t.valueUsd }); for (const e of es) e.dispatch("trade", payload); }
+        window.__burst.fx.push(__sporeMap.fx());
+        if (i < flat.length) setTimeout(tick, 10); else window.__burst.done = true;
+      };
+      tick();
+      return true;
+    })()`);
+    await sleep(1500);
+    result.shotBurst = await shot("map-1440-burst.png");
+    await waitFor("window.__burst && window.__burst.done", 10_000, "trade burst");
+    await sleep(300);
+    const bs = await stats();
+    const burst = await evalJs<{ fx: number[]; n: number }>("window.__burst");
+    const fxPeak = Math.max(0, ...burst.fx);
+    result.burst = { trades: burst.n, fxPeak, settled: bs.settled, settling: bs.settling };
+    check(fxPeak > 0, "trade burst: fx() stayed 0 (no ripples drawn)");
+    check(bs.settled.p95 <= BUDGET.settled, `burst settled p95 ${bs.settled.p95.toFixed(1)} ms > ${BUDGET.settled}`);
+    check(Math.max(bs.settled.max, bs.settling.max) <= BUDGET.gestureMax, `burst max frame ${Math.max(bs.settled.max, bs.settling.max).toFixed(1)} ms > ${BUDGET.gestureMax}`);
+    // ---- highlight filters dim, never remove
+    await toFit();
+    result.highlight = {};
+    for (const kind of ["min1k", "ours"]) {
+      const matches = await evalJs<number>(`__sporeMap.testHighlight(${JSON.stringify(kind)})`);
+      await sleep(800);
+      await evalJs("__sporeMap.resetFrames()");
+      await sleep(2000);
+      const hs = await stats();
+      (result.highlight as Record<string, unknown>)[kind] = { matches, settled: hs.settled, drawn: await evalJs<number>("__sporeMap.drawn()") };
+      check(hs.settled.avg <= BUDGET.settled, `highlight ${kind}: settled avg ${hs.settled.avg.toFixed(1)} ms > ${BUDGET.settled}`);
+      await shot(`map-1440-hl-${kind}.png`);
+    }
+    await evalJs("__sporeMap.testHighlight(null)");
+    // ---- flight: from fit to a coin far from the centre, sampled every animation frame
+    await toFit();
+    const far = await evalJs<{ mint: string; x: number; y: number } | null>(`(() => {
+      const b = document.querySelector(".bm-canvas").getBoundingClientRect();
+      const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+      let best = null, bestD = -1;
+      for (const c of __sporeMap.clusters(4000)) {
+        if (c.count < 3) continue;
+        const p = __sporeMap.screenOf(c.root);
+        if (!p || p.x < Math.max(b.left, 380) || p.x > b.right - 40 || p.y < b.top + 60 || p.y > b.bottom - 40) continue;
+        const d = Math.hypot(p.x - cx, p.y - cy);
+        if (d > bestD) { bestD = d; best = { mint: c.root, x: Math.round(p.x), y: Math.round(p.y) }; }
+      }
+      return best;
+    })()`);
+    check(!!far, "flight: no on-screen target found");
+    if (far) {
+      await evalJs(`(() => {
+        const mint = ${JSON.stringify(far.mint)};
+        const rec = window.__flight = { samples: [], t0: performance.now() };
+        const loop = () => {
+          const p = __sporeMap.screenOf(mint);
+          rec.samples.push({ t: performance.now() - rec.t0, k: __sporeMap.zoom(), x: p ? p.x : NaN, y: p ? p.y : NaN, flying: __sporeMap.flying() });
+          if (performance.now() - rec.t0 < 2600) requestAnimationFrame(loop);
+        };
+        __sporeMap.fly(mint);
+        requestAnimationFrame(loop);
+        return true;
+      })()`);
+      await sleep(2900);
+      const fl = await evalJs<{ samples: { t: number; k: number; x: number; y: number; flying: boolean }[] }>("window.__flight");
+      const vw = await evalJs<{ w: number; h: number }>("({ w: innerWidth, h: innerHeight })");
+      const s = fl.samples;
+      const off = s.filter((p) => !(p.x >= 0 && p.x <= vw.w && p.y >= 0 && p.y <= vw.h)).length;
+      let ratio = 1; for (let q = 1; q < s.length; q++) { const a = s[q - 1].k, b2 = s[q].k; ratio = Math.max(ratio, a / b2, b2 / a); }
+      const landed = s.find((p) => !p.flying);
+      result.flight = { target: far, frames: s.length, offscreenFrames: off, maxKRatio: round(ratio), landedMs: landed ? Math.round(landed.t) : null, k0: s[0]?.k, k1: s[s.length - 1]?.k };
+      check(s.length > 10 && off === 0, `flight: target off screen in ${off} of ${s.length} frames`);
+      check(ratio <= BUDGET.flightKRatio, `flight: zoom changed ×${ratio.toFixed(3)} in one frame (budget ${BUDGET.flightKRatio})`);
+      check(!!landed && landed.t <= BUDGET.flightMs, `flight landed after ${landed ? Math.round(landed.t) : "never"} ms (budget ${BUDGET.flightMs})`);
+      result.shotFlight = await shot("map-1440-flight-landed.png");
+      // leave the selection (the page clears ?focus on Escape)
+      await evalJs(`document.querySelector(".bm").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+      await sleep(300);
+    }
+    await toFit();
+  }
 } catch (e) {
   fails.push(`crashed: ${(e as Error).message}`);
 } finally {

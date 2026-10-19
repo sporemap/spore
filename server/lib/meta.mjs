@@ -19,6 +19,12 @@ export const META_TTL_S = 7 * 24 * 3600;      // a resolved JSON with an image i
 export const META_NOIMAGE_TTL_S = 24 * 3600;  // resolved, but no usable image: looked at again daily
 export const META_RETRY_S = 15 * 60;          // first retry after a failure; doubles per attempt up to META_RETRY_MAX_S
 export const META_RETRY_MAX_S = 24 * 3600;
+// Version of the rule that decides which image URLs are usable (`isAllowedImageUrl`). Rows resolved
+// under an older rule with no image are fetched once more at boot whatever their age, instead of
+// waiting out META_NOIMAGE_TTL_S: rule 1 kept a host allowlist, rule 2 (2026-10-19) admits any
+// public https host, and 5.2k coins (several of the largest roots among them) had lost their logo
+// to the old list. Bump it whenever the rule widens again.
+export const META_IMAGE_RULE = 2;
 export const IMAGE_TTL_MS = 24 * 3600 * 1000;
 export const IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 export const META_MAX_BYTES = 512 * 1024;
@@ -268,6 +274,7 @@ export class MetaFetcher {
     this.pacer = pacer ?? new HostPacer({ fetchImpl });
     this.concurrency = concurrency; this.active = 0;
     this.queue = []; this.head = 0; this.queued = new Set(); this.inFlight = new Set(); this.attempts = new Map();
+    this.recheck = new Set();       // uris due once more whatever their age (META_IMAGE_RULE); each leaves when fetched
     this.stats = { fetched: 0, failed: 0, rateLimited: 0, sweeps: 0 };
     this.stopped = false; this.timer = null; this.coverageCache = null;
   }
@@ -275,7 +282,7 @@ export class MetaFetcher {
   get pendingCount() { return this.queue.length - this.head + this.inFlight.size; }
   needsFetch(uri, nowS = Math.floor(this.now() / 1000)) {
     const m = this.model.meta.get(uri);
-    if (!m) return true;
+    if (!m || this.recheck.has(uri)) return true;
     const age = nowS - m.fetchedAt;
     if (m.ok) return age > (m.image ? META_TTL_S : META_NOIMAGE_TTL_S);
     return age > retryAfterS(m.attempts ?? 1);
@@ -309,8 +316,25 @@ export class MetaFetcher {
     this.#pump();
     return n;
   }
-  /** Starts the periodic sweep (the first one runs at once). */
+  /**
+   * One-time re-check after the image rule widened (META_IMAGE_RULE): every resolved row without an
+   * image becomes due at once, so the next sweep fetches them in its usual order (locked value, then
+   * recency: the largest roots first). Gated by a kv record, so it happens once per rule change, not
+   * once per boot; rows that have an image are never touched. Returns how many uris were queued.
+   */
+  queueImageRecheck() {
+    const db = this.model.db;
+    if (typeof db?.kvGet !== "function" || typeof db?.kvSet !== "function") return 0;
+    if (Number(db.kvGet("metaImageRule", 1)) >= META_IMAGE_RULE) return 0;
+    let n = 0;
+    for (const [uri, m] of this.model.meta ?? []) if (m?.ok && !m.image) { this.recheck.add(uri); n++; }
+    this.log.info?.(`meta: image recheck queued ${n}`);
+    db.kvSet("metaImageRule", META_IMAGE_RULE);
+    return n;
+  }
+  /** Starts the periodic sweep (the first one runs at once, after the one-time image re-check is queued). */
   start({ sweepMs = this.sweepMs } = {}) {
+    try { this.queueImageRecheck(); } catch (e) { this.log.warn?.(`meta: image recheck failed: ${e.message}`); }
     try { this.sweep(); } catch (e) { this.log.warn?.(`meta: sweep failed: ${e.message}`); }
     this.timer = setInterval(() => { try { this.sweep(); } catch (e) { this.log.warn?.(`meta: sweep failed: ${e.message}`); } }, sweepMs);
     this.timer.unref?.();
@@ -335,7 +359,7 @@ export class MetaFetcher {
     return value;
   }
   /** Coverage over tracked coins plus this process's counters under `run` (so `failed` is always the coverage count). */
-  snapshot() { return { ...this.coverage(), run: { ...this.stats, rotated: this.pacer?.stats?.rotated ?? 0 } }; }
+  snapshot() { return { ...this.coverage(), run: { ...this.stats, rotated: this.pacer?.stats?.rotated ?? 0, recheck: this.recheck.size } }; }
   #next() {
     if (this.head >= this.queue.length) return undefined;
     const uri = this.queue[this.head++];
@@ -358,7 +382,7 @@ export class MetaFetcher {
       // never resolved is stored empty. Either way the attempt count drives the next retry.
       if (prev?.ok) this.model.setMeta(uri, { ...prev, fetchedAt, error, attempts });
       else this.model.setMeta(uri, { image: null, description: null, twitter: null, telegram: null, website: null, fetchedAt, ok: false, error, attempts });
-      this.stats.failed++; this.attempts.delete(uri);
+      this.stats.failed++; this.attempts.delete(uri); this.recheck.delete(uri);
     };
     // Our own metadata host: the file is on disk, so no request (this machine may not even reach the domain).
     const local = localMetaFile(uri);
@@ -366,7 +390,7 @@ export class MetaFetcher {
       try {
         const meta = pickMeta(JSON.parse(readFileSync(local.file, "utf8")));
         this.model.setMeta(uri, { ...meta, fetchedAt, ok: true, error: null, attempts: 0 });
-        this.stats.fetched++; this.attempts.delete(uri);
+        this.stats.fetched++; this.attempts.delete(uri); this.recheck.delete(uri);
         return;
       } catch { /* unreadable locally: fall through to the network */ }
     }
@@ -383,7 +407,7 @@ export class MetaFetcher {
       const body = await readBounded(hit.res, META_MAX_BYTES);
       const meta = pickMeta(JSON.parse(body.toString("utf8")));
       this.model.setMeta(uri, { ...meta, fetchedAt, ok: true, error: null, attempts: 0 });
-      this.stats.fetched++; this.attempts.delete(uri);
+      this.stats.fetched++; this.attempts.delete(uri); this.recheck.delete(uri);
     } catch (e) {
       fail(String(e.message ?? e).slice(0, 120));
     }
