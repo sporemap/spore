@@ -308,6 +308,12 @@ export class MetaFetcher {
       if (typeof uri !== "string" || this.queued.has(uri) || this.inFlight.has(uri) || !isAllowedMetaUrl(uri) || !this.needsFetch(uri, nowS)) continue;
       cands.push({ uri, locked: d.get(c.mint)?.lockedUsd ?? -1, at: c.createdAt ?? 0 });
     }
+    // The listed quote assets the map draws at the top of their families (PUMP, USDC, $baton…) need logos too.
+    for (const mint of typeof this.model.assetFamilies === "function" ? this.model.assetFamilies().keys() : []) {
+      const uri = this.model.mints?.get(mint)?.uri;
+      if (typeof uri !== "string" || this.queued.has(uri) || this.inFlight.has(uri) || !isAllowedMetaUrl(uri) || !this.needsFetch(uri, nowS)) continue;
+      cands.push({ uri, locked: Number.MAX_SAFE_INTEGER, at: 0 });
+    }
     cands.sort((a, b) => b.locked - a.locked || b.at - a.at);
     let n = 0;
     for (const x of cands) { if (n >= max || this.queued.has(x.uri)) continue; this.queued.add(x.uri); this.queue.push(x.uri); n++; }

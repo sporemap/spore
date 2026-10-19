@@ -124,6 +124,18 @@ export class MapStore {
     return this.letter[i];
   }
 
+  /// The map draws and lays out by generation inside the drawn family (hops to its top), not by
+  /// pump.fun's depth: a coin quoted in a listed asset (PUMP, USDC, $baton…) is depth 0 on-chain but
+  /// sits one level under that asset here, so it is coloured and pulled like a child, not a root.
+  applyGenerations() {
+    for (let i = 0; i < this.n; i++) {
+      if (this.parent[i] < 0) continue;
+      let g = 0, cur = i;
+      while (this.parent[cur] >= 0 && g < 16) { cur = this.parent[cur]; g++; }
+      const real = this.data[i].depth;
+      if (g > real) { this.depth[i] = Math.min(255, g); this.color[i] = colorIdx(g); }
+    }
+  }
   /// Parent indices and the link arrays, from the records' parentMint.
   rebuildLinks() {
     const n = this.n;
@@ -133,6 +145,7 @@ export class MapStore {
     let k = 0;
     for (let i = 0; i < n; i++) if (this.parent[i] >= 0) { this.lsrc[k] = this.parent[i]; this.ldst[k] = i; k++; }
     this.m = k;
+    this.applyGenerations();
     // CSR child lists (hover highlighting, side panel chips)
     const start = new Int32Array(n + 1);
     for (let i = 0; i < n; i++) if (this.parent[i] >= 0) start[this.parent[i] + 1]++;

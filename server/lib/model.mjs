@@ -346,6 +346,44 @@ export class Model {
     const d = this.computed().get(c.mint) ?? {};
     return { children: d.children ?? 0, descendants: d.descendants ?? 0, lockedQuote: d.lockedQuote ?? 0n, lockedUsd: d.lockedUsd ?? null, otherChildren: 0 };
   }
+  /**
+   * Listed quote assets (PUMP, USDC, WBTC, tokenized stocks, graduated coins such as $baton) that
+   * tracked depth-0 coins are quoted in. pump.fun counts a coin quoted in a listed asset as a root
+   * (depth 0), so without this the full map has no node above those coins: the asset becomes the
+   * top of its family, and every coin quoted in it is drawn under it, with or without children.
+   */
+  assetFamilies() {
+    if (this.assetVersion === this.version && this.assetCache) return this.assetCache;
+    const fam = new Map();
+    for (const c of this.coins.values()) {
+      if (!c.tracked || c.depth !== 0 || !c.quoteMint || c.quoteMint === SOL_MINT) continue;
+      let list = fam.get(c.quoteMint);
+      if (!list) { list = []; fam.set(c.quoteMint, list); }
+      list.push(c);
+    }
+    this.assetCache = fam; this.assetVersion = this.version;
+    return fam;
+  }
+  /** The bubble of a listed quote asset: its name and logo from the mint metadata, the value its family has locked in it. */
+  assetMapRef(mint) {
+    const kids = this.assetFamilies().get(mint) ?? [];
+    const d = this.computed();
+    const { name, symbol } = this.nameOf(mint);
+    const dec = this.decimalsOf(mint), quoteUsd = this.quoteUsdOf(mint);
+    let locked = 0n, descendants = 0, updatedAt = 0;
+    for (const k of kids) {
+      locked += BigInt((k.migrated ? k.poolQuote : k.realQuoteReserves) ?? 0);
+      descendants += 1 + (d.get(k.mint)?.descendants ?? 0);
+      updatedAt = Math.max(updatedAt, k.updatedAt ?? 0);
+    }
+    const supply = this.mints.get(mint)?.supply;
+    return {
+      mint, name, symbol, image: imageProxyUrl(this.metaFor({ mint })?.image), depth: 0, ours: false, oursPending: false, asset: true,
+      mcapUsd: quoteUsd != null && supply != null ? quoteUsd * units(supply, dec) : null,
+      lockedUsd: quoteUsd != null ? units(locked, dec) * quoteUsd : null,
+      children: kids.length, descendants, otherChildren: 0, migrated: false, createdAt: null, updatedAt,
+    };
+  }
   /** Every depth-0 coin with at least one child on pump.fun, regardless of the mode. */
   allRoots() { const d = this.computed(); return this.tracked().filter((c) => c.depth === 0 && (d.get(c.mint)?.children ?? 0) > 0); }
   inScope(mint) { return this.scope().inScope.has(mint); }
@@ -480,7 +518,12 @@ export class Model {
   /** Deepest level the full map descends to: the program's current depth cap (every descendant), never less than 2. */
   mapDepth() { return Math.max(2, this.global?.maxCurveDepth ?? 2); }
   /** Roots the map draws: every depth-0 coin with a child (`all`), or the roots of the listing scope. */
-  mapRoots(all) { return all ? this.allRoots() : this.visibleRoots(); }
+  mapRoots(all) {
+    if (!all) return this.visibleRoots();
+    const fam = this.assetFamilies();
+    const solRoots = this.allRoots().filter((c) => !fam.has(c.quoteMint ?? ""));
+    return [...solRoots, ...[...fam.keys()].map((mint) => ({ mint, asset: true, depth: -1 }))];
+  }
   mapChildren(mint, all) { return all ? this.childrenOf(mint) : this.visibleChildren(mint); }
   /**
    * Every root and every descendant as `{ coin: mapRef, children }` nodes, no fan-out cap. Built
@@ -499,8 +542,9 @@ export class Model {
     const stat = (c) => (all ? this.scopedAll(c) : this.scoped(c));
     const cmp = (a, b) => (stat(b).lockedUsd ?? -1) - (stat(a).lockedUsd ?? -1) || (d.get(b.mint)?.priceUsd ?? -1) - (d.get(a.mint)?.priceUsd ?? -1);
     let total = 0;
-    const node = (c, left) => { total++; return { coin: this.mapRef(c, all), children: left > 0 ? this.mapChildren(c.mint, all).sort(cmp).map((k) => node(k, left - 1)) : [] }; };
-    const roots = this.mapRoots(all).sort(cmp).map((r) => node(r, depth));
+    const node = (c, left) => { total++; return { coin: c.asset ? this.assetMapRef(c.mint) : this.mapRef(c, all), children: left > 0 ? this.mapChildren(c.mint, all).sort(cmp).map((k) => node(k, left - 1)) : [] }; };
+    const rootLocked = new Map(this.mapRoots(all).map((r) => [r, (r.asset ? this.assetMapRef(r.mint).lockedUsd : stat(r).lockedUsd) ?? -1]));
+    const roots = [...rootLocked.keys()].sort((a, b) => rootLocked.get(b) - rootLocked.get(a)).map((r) => node(r, r.asset ? depth + 1 : depth));
     const body = { roots, scope: all ? "all" : this.mode, version: this.version, generatedAt, total };
     this.lastGeneratedAt = Math.max(this.lastGeneratedAt, generatedAt);
     this.mapCache = { key, all, version: this.version, at: generatedAt, body, total, prepared: null, buildMs: Math.round(performance.now() - t0) };
@@ -514,7 +558,7 @@ export class Model {
     const depth = this.mapDepth();
     let total = 0;
     const walk = (c, left) => { total++; if (left > 0) for (const k of this.mapChildren(c.mint, all)) walk(k, left - 1); };
-    for (const r of this.mapRoots(all)) walk(r, depth);
+    for (const r of this.mapRoots(all)) walk(r, r.asset ? depth + 1 : depth);
     this.totalCache = { all, version: this.version, total };
     return total;
   }
@@ -522,7 +566,7 @@ export class Model {
   #onMap(c, all) {
     if (!c.tracked) return false;
     if (!all && !this.scope().inScope.has(c.mint)) return false;
-    if (c.depth === 0) return this.mapChildren(c.mint, all).length > 0;
+    if (c.depth === 0) return (all && !!c.quoteMint && c.quoteMint !== SOL_MINT) || this.mapChildren(c.mint, all).length > 0;
     if (c.depth > this.mapDepth()) return false;
     const anc = this.ancestors(c.mint);
     return anc.length > 0 && anc[anc.length - 1].depth === 0 && anc.every((a) => a.tracked && (all || this.scope().inScope.has(a.mint)));
@@ -537,11 +581,15 @@ export class Model {
     const hit = this.mapSinceCache.get(key);
     if (hit && (hit.version === this.version || this.now() - hit.at < MAP_CACHE_MS)) return hit;
     const generatedAt = this.now();
-    const nodes = [];
+    const nodes = [], assets = new Set();
+    const fam = all ? this.assetFamilies() : new Map();
     for (const c of this.coins.values()) {
       if (!((c.updatedAt ?? 0) > since) || !this.#onMap(c, all)) continue;
-      nodes.push({ ...this.mapRef(c, all), parentMint: c.depth > 0 ? c.quoteMint : null });
+      const underAsset = c.depth === 0 && fam.has(c.quoteMint ?? "");
+      if (underAsset) assets.add(c.quoteMint);
+      nodes.push({ ...this.mapRef(c, all), parentMint: c.depth > 0 || underAsset ? c.quoteMint : null });
     }
+    for (const mint of assets) nodes.push({ ...this.assetMapRef(mint), parentMint: null });
     nodes.sort((a, b) => (b.lockedUsd ?? -1) - (a.lockedUsd ?? -1));
     const body = { nodes, removed: [], generatedAt, total: this.mapTotal(all), version: this.version };
     this.lastGeneratedAt = Math.max(this.lastGeneratedAt, generatedAt);

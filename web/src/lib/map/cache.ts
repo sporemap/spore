@@ -8,7 +8,7 @@
 import type { BubbleNode } from "./types";
 
 /// Bump when the record shape changes: the upgrade handler drops every store, so an old cache is cleared.
-export const CACHE_V = 2;
+export const CACHE_V = 3; // 3: listed-asset families (PUMP, USDC, $baton…) sit above their coins — old caches hold those coins as separate roots
 const DB_NAME = "spore-map";
 const CHUNK = 2500;
 

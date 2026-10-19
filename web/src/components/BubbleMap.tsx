@@ -332,7 +332,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
           if (store.data[i].image !== d.image) store.gen[i]++;
           store.data[i] = d;
           store.flags[i] = (store.flags[i] & (F_FIXED | F_MATCH)) | flagsOf(d);
-          store.depth[i] = Math.min(255, d.depth); store.color[i] = colorIdx(d.depth);
+          if (store.parent[i] < 0 || d.depth > 0) { store.depth[i] = Math.min(255, d.depth); store.color[i] = colorIdx(d.depth); } // a family member under a listed asset keeps its generation (store.applyGenerations)
         }
         if (Math.abs(store.rT[i] - r) > 0.25) { store.r0[i] = store.r[i]; store.rT[i] = r; store.rt0[i] = now; radiiChanged++; }
       }
@@ -367,7 +367,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
         else if (p >= 0 && Number.isFinite(store.nx[p]) && !cold) {
           const a = Math.random() * Math.PI * 2, dd = store.rT[p] + store.rT[i] + 8;
           store.nx[i] = store.nx[p] + Math.cos(a) * dd; store.ny[i] = store.ny[p] + Math.sin(a) * dd;
-        } else if (p < 0 || d.depth === 0) { store.nx[i] = c.cx + (Math.random() - 0.5) * 2; store.ny[i] = c.cy + (Math.random() - 0.5) * 2; }
+        } else if (p < 0) { store.nx[i] = c.cx + (Math.random() - 0.5) * 2; store.ny[i] = c.cy + (Math.random() - 0.5) * 2; }
         else {
           const k = perCluster.get(ci) ?? 0; perCluster.set(ci, k + 1);
           const a = k * GOLDEN, dd = (c.R * 0.9) * Math.sqrt((k + 1) / Math.max(2, c.members.length)) + store.rT[store.rootOf(i)] + 4;
