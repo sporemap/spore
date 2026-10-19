@@ -10,6 +10,10 @@
 //   (g) phone (390×844): a deep link to a top-200 root keeps roots at 200 (the widen race)
 //   (h) logos: after zooming through three dense clusters the thumbnail cache is under its pixel
 //       budget, and a ≥ 200 px bubble draws a 256 px thumbnail
+//   (i) family tops (lib/map/sizing.ts): in every family the top is ≥ 1.5× its largest member and no
+//       member's centre lies inside the top's disc after settling; in a mid-size family a subtree drag
+//       moves rigidly, a child dropped on its top's centre ends outside it, and a drag of the top moves
+//       the whole tree rigidly, all without a member left inside the top
 //   and 0 console errors throughout.
 //
 //   API_PORT=8795 npx vite --port 5252 --host 127.0.0.1 &
@@ -126,7 +130,9 @@ try {
     const big = await evalJs<{ root: string; count: number; cx: number; cy: number; cr: number } | null>("(__sporeMap.clusters(1) || [])[0] || null");
     check(!!big, "(b) no cluster");
     if (big) {
-      // a point inside the cluster's screen circle that hands the pointer to the cluster (not a ≥ 3 px bubble)
+      // a point inside the cluster's screen circle that hands the pointer to the cluster (not a ≥ 3 px
+      // bubble), with 3 px of room around it: the family top sits in the middle as a bigger bubble, and
+      // a point on its hit rim flips with the event's rounding
       const pt = await evalJs<{ x: number; y: number } | null>(`(() => {
         const cam = __sporeMap.camera(), b = document.querySelector(".bm-canvas").getBoundingClientRect();
         const c = ${JSON.stringify(big)};
@@ -135,7 +141,8 @@ try {
           const rr = r * ring / 10, x = cx + Math.cos(a * Math.PI / 12) * rr, y = cy + Math.sin(a * Math.PI / 12) * rr;
           if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) continue;
           const el = document.elementFromPoint(x, y); if (!el || !el.classList.contains("bm-canvas")) continue;
-          const p = __sporeMap.pick(x, y); if (p.cluster === c.root && !p.node) return { x, y };
+          const free = (px, py) => { const p = __sporeMap.pick(px, py); return p.cluster === c.root && !p.node; };
+          if (free(x, y) && free(x + 3, y) && free(x - 3, y) && free(x, y + 3) && free(x, y - 3)) return { x, y };
           if (ring === 0) break;
         }
         return null; })()`);
@@ -263,6 +270,73 @@ try {
       check((r.sr ?? 0) >= 100, `(h) the logo bubble is only ${r.sr} px in radius`);
       check(r.logo === 256, `(h) a ${Math.round(2 * (r.sr ?? 0))} px bubble draws a ${r.logo} px thumbnail, expected 256`);
       result.shotSharp = await shot("interact-1440-logo.png");
+    }
+  }
+
+  // ---------------------------------------------------------------- (i) family tops: biggest, central, outside; drag
+  if (want("i")) {
+    await evalJs(`history.replaceState({}, "", "/map?roots=all"); dispatchEvent(new PopStateEvent("popstate"))`);
+    await settle("settle before the family-top checks", 120_000).catch(() => null);
+    // one family's numbers: top radius, largest member, member centres inside / rims over the top's disc
+    await evalJs(`window.__fam = (root) => { const M = __sporeMap, mem = M.members(root), t = M.node(root); let inside = 0, overlap = 0, maxC = 0; for (const m of mem) { if (m === root) continue; const d = M.node(m); const dist = Math.hypot(d.x - t.x, d.y - t.y); if (dist < t.r) inside++; if (dist < t.r + d.r) overlap++; if (d.r > maxC) maxC = d.r; } return { n: mem.length, topR: t.r, maxC, ratio: maxC ? t.r / maxC : Infinity, inside, overlap }; }; true`);
+    const all = await evalJs<{ families: number; worst: number; below: string[]; inside: string[]; overlap: number }>(`(() => { let families = 0, worst = Infinity, overlap = 0; const below = [], inside = []; for (const c of __sporeMap.clusters(100000)) { if (c.count < 2) continue; const f = __fam(c.root); families++; if (f.ratio < worst) worst = f.ratio; if (f.ratio < 1.5) below.push(c.title + " " + f.topR.toFixed(1) + "/" + f.maxC.toFixed(1)); if (f.inside) inside.push(c.title + " ×" + f.inside); overlap += f.overlap; } return { families, worst, below: below.slice(0, 8), inside: inside.slice(0, 8), overlap }; })()`);
+    result.tops = all;
+    check(all.families > 0, "(i) no family on the map");
+    check(all.below.length === 0, `(i) family tops under 1.5× their largest member: ${all.below.join(", ")}`);
+    check(all.inside.length === 0, `(i) member centres inside their top's disc: ${all.inside.join(", ")}`);
+    const fam = await evalJs<string | null>(`(() => { const cl = __sporeMap.clusters(400); const g = cl.find((c) => __sporeMap.node(c.root)?.symbol === "GTA"); if (g) return g.root; const m = cl.find((c) => c.count >= 30 && c.count <= 300); return m ? m.root : null; })()`);
+    check(!!fam, "(i) no mid-size family to drag in");
+    if (fam) {
+      const F = JSON.stringify(fam);
+      const cr = await evalJs<number>(`__sporeMap.clusters(100000).find((c) => c.root === ${F}).cr`);
+      await evalJs(`__sporeMap.zoomTo(${F}, ${Math.min(3, (0.42 * H) / cr)})`);
+      await sleep(2500);
+      const screenOfAll = (ms: string[]) => evalJs<[number, number][]>(`(${JSON.stringify(ms)}).map((m) => { const s = __sporeMap.screenOf(m); return [s.x, s.y]; })`);
+      const dragPath = async (x0: number, y0: number, x1: number, y1: number, mid: string | null) => {
+        await mouse("mouseMoved", x0, y0); await mouse("mousePressed", x0, y0, { button: "left", buttons: 1, clickCount: 1 });
+        let during: unknown = null;
+        for (let q = 1; q <= 12; q++) { const u = q / 12; await mouse("mouseMoved", x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, { button: "left", buttons: 1 }); await sleep(30); if (q === 12 && mid) during = await evalJs(mid); }
+        await mouse("mouseReleased", x1, y1, { button: "left", buttons: 0, clickCount: 1 });
+        return during;
+      };
+      const rigidErr = (a: [number, number][], b: [number, number][], dx: number, dy: number) => { let e = 0; for (let q = 0; q < a.length; q++) e = Math.max(e, Math.hypot(b[q][0] - a[q][0] - dx, b[q][1] - a[q][1] - dy)); return Math.round(e * 100) / 100; };
+      const child = await evalJs<{ m: string; c: number; s: { x: number; y: number; r: number } } | null>(`(() => { const M = __sporeMap; let best = null; for (const m of M.children(${F})) { const s = M.screenOf(m); if (!s || s.r < 5 || s.x < 380 || s.x > ${W - 40} || s.y < 80 || s.y > ${H - 20}) continue; const c = M.children(m).length; if (!best || c > best.c) best = { m, c, s }; } return best; })()`);
+      check(!!child, "(i) no child of the family on screen to drag");
+      if (child) {
+        const C = JSON.stringify(child.m);
+        // subtree drag, outward: every node of the subtree moves by the pointer's delta while held
+        const top0 = (await evalJs<{ x: number; y: number }>(`__sporeMap.screenOf(${F})`))!;
+        const ux = child.s.x - top0.x, uy = child.s.y - top0.y, ul = Math.hypot(ux, uy) || 1, dx = (ux / ul) * 140, dy = (uy / ul) * 140;
+        const sub = await evalJs<string[]>(`(() => { const M = __sporeMap, out = [], st = [${C}]; while (st.length) { const m = st.pop(); out.push(m); st.push(...M.children(m)); } return out; })()`);
+        const p0 = await screenOfAll(sub);
+        const d1 = (await dragPath(child.s.x, child.s.y, child.s.x + dx, child.s.y + dy, `({ drag: __sporeMap.drag(), pos: (${JSON.stringify(sub)}).map((m) => { const s = __sporeMap.screenOf(m); return [s.x, s.y]; }) })`)) as { drag: { node: string; n: number; whole: boolean } | null; pos: [number, number][] };
+        const e1 = rigidErr(p0, d1.pos, dx, dy);
+        await settle("the subtree drop to ease", 30_000).catch(() => null);
+        const after1 = await evalJs<{ inside: number; overlap: number }>(`__fam(${F})`);
+        // the child dropped right on its top's centre
+        const c1 = await evalJs<{ x: number; y: number }>(`__sporeMap.screenOf(${C})`), t1 = await evalJs<{ x: number; y: number }>(`__sporeMap.screenOf(${F})`);
+        await dragPath(c1.x, c1.y, t1.x + 3, t1.y + 2, null);
+        await settle("the drop on the top to ease", 30_000).catch(() => null);
+        await sleep(600);
+        const after2 = await evalJs<{ inside: number; overlap: number; dist: number; need: number }>(`(() => { const f = __fam(${F}), t = __sporeMap.node(${F}), c = __sporeMap.node(${C}); return { ...f, dist: Math.hypot(c.x - t.x, c.y - t.y), need: t.r }; })()`);
+        result.shotTopDrop = await shot("interact-1440-top-drop.png");
+        // the top itself: the whole tree moves rigidly
+        const mem = await evalJs<string[]>(`__sporeMap.members(${F})`);
+        const t2 = await evalJs<{ x: number; y: number }>(`__sporeMap.screenOf(${F})`);
+        const p2 = await screenOfAll(mem);
+        const d3 = (await dragPath(t2.x, t2.y, t2.x - 120, t2.y + 60, `({ drag: __sporeMap.drag(), pos: (${JSON.stringify(mem)}).map((m) => { const s = __sporeMap.screenOf(m); return [s.x, s.y]; }) })`)) as { drag: { node: string; n: number; whole: boolean } | null; pos: [number, number][] };
+        const e3 = rigidErr(p2, d3.pos, -120, 60);
+        await settle("the tree drop to ease", 30_000).catch(() => null);
+        const after3 = await evalJs<{ inside: number; overlap: number }>(`__fam(${F})`);
+        result.topsDrag = { family: fam, child: child.m, subtree: { n: sub.length, drag: d1.drag, rigidErrPx: e1, after: after1 }, dropOnTop: after2, tree: { n: mem.length, drag: d3.drag, rigidErrPx: e3, after: after3 } };
+        check(d1.drag?.node === child.m && d1.drag.n === sub.length && !d1.drag.whole, `(i) the subtree drag did not take the child's subtree (${JSON.stringify(d1.drag)})`);
+        check(e1 <= 2, `(i) the subtree moved ${e1} px off the pointer's delta while held`);
+        check(after1.inside === 0, `(i) ${after1.inside} member(s) inside the top after a subtree drop`);
+        check(after2.inside === 0 && after2.dist >= after2.need, `(i) a child dropped on its top stayed inside it (${after2.dist.toFixed(1)} < ${after2.need.toFixed(1)})`);
+        check(d3.drag?.whole === true && d3.drag.n === mem.length, `(i) dragging the top did not take the whole tree (${JSON.stringify(d3.drag)})`);
+        check(e3 <= 2, `(i) the tree moved ${e3} px off the pointer's delta while held`);
+        check(after3.inside === 0, `(i) ${after3.inside} member(s) inside the top after the tree drop`);
+      }
     }
   }
 

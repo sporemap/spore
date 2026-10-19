@@ -13,17 +13,24 @@
 //     lights its own child links as one thin stroke (fainter the more children it has, ≤ 36 dots) and
 //     its ancestor path brighter; nothing is lit or dimmed while a bubble is being dragged;
 //  5. trade fx (fx.ts): ripples, $500+ flashes and routed-buy comets;
-//  6. bubbles, smallest first, in tiers by screen radius: specks (< 2.5 px) batched into rect fills;
+//  6. bubbles in three groups: every bubble that is not a family top, then the family tops (the store
+//     orders them last; each group's vector batches are flushed before the next, so a top is never
+//     covered by its own children), then the hovered/selected/focused ones (slow path). Inside a group
+//     smallest first, in tiers by screen radius: specks (< 2.5 px) batched into rect fills;
 //     small bubbles (< 7 px) as batched vectors (one halo fill, one body fill and one ring stroke per
 //     colour and dim level: in software raster a sprite blit costs several times a path arc, and these
 //     are the thousands); then letter avatars shared per letter + colour + size, or a per-node logo
 //     sprite once the logo is decoded. Sprite builds are budgeted (12 builds or 4 ms per frame, 2 during
 //     a user gesture); over budget a bubble reuses its last sprite scaled. Bubbles over 128 px are drawn
 //     directly, and the hovered/selected/focused ones (at most three) take the slow path (gradients,
-//     clipping, dashed rings). Under a highlight the loop runs twice: dimmed non-matches, then matches;
+//     clipping, dashed rings). A family top keeps its logo (or letter) down to 6 px and carries a
+//     subtle ring in its depth colour (batched per colour). Under a highlight each group runs twice:
+//     dimmed non-matches, then matches;
 //  7. Spore beacons (lime ring + breathing halo, never smaller than 4 px), cluster titles at overview
 //     zoom (two-tone cached bitmaps, culled on an estimated width before they are built), then node
-//     labels (cached per node, fading in by size), all overlap-culled against one rect buffer.
+//     labels biggest first (cached per node, fading in by size), all overlap-culled against one rect
+//     buffer. A tree's title names its top until the top is big enough to carry its own label; from
+//     then on both show.
 // Colours used per frame come from precomputed rgba tables; scratch buffers are module-level.
 import { easeCubicOut, select, zoomIdentity, type ZoomBehavior, type ZoomTransform } from "d3";
 import { DEBUG_HOOKS } from "../../lib/map/debug";
@@ -39,6 +46,10 @@ export { centerOn, fitFor } from "./camera";
 export const GROW_MS = 700, PULSE_MS = 1_800, TWEEN_MS = 600;
 /// Every bubble at least this big on screen gets its ticker (DESIGN §11.5), at most MAX_LABELS of them.
 export const LABEL_R = 9, MAX_LABELS = 160, IMG_R = 9, SPECK_R = 2.5, SMALL_R = 7;
+/// A family top is drawn as a sprite with its logo (or letter) from this screen radius on.
+export const TOP_LOGO_R = 6;
+/// Cluster titles show while the tree is at most this big on screen (radius, px).
+const TITLE_MAX_R = 260;
 /// The biggest bubbles are named at any zoom (owner 2026-10-19: names must be readable on open, even
 /// when the whole forest is in view and nothing reaches LABEL_R); overlap culling still applies.
 export const ALWAYS_LABELS = 36;
@@ -149,6 +160,10 @@ const exactA = (hex: string, a: number) => `rgba(${rgbOf(hex)},${Math.round(a * 
 const SMALL_HALO = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.11 * m)));
 const SMALL_FILL = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.42 * m)));
 const SMALL_RING = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.8 * m)));
+/// the family top's outer ring per (dim level, colour), its width and its gap to the rim (px)
+const TOP_RING = DIM_MUL.flatMap((m) => COLORS.map((c) => exactA(c, 0.5 * m)));
+const TOP_RING_W = 1.2;
+const topGap = (sr: number) => (sr < 33 ? 2 : sr * 0.06);
 /// link strokes per (class, colour), then dimmed/faint ones per colour (key 12 + colour)
 /// (huge families: one neutral tint at key 8, whatever the depth: a 1 000-coin family is a texture)
 const LINK_STYLE = [...LINK_A.flatMap((a, cls) => COLORS.map((c) => exactA(cls === 2 ? HULL : c, a))), ...COLORS.map((c) => exactA(c, 0.05))];
@@ -167,6 +182,14 @@ let curAlpha = 1, drawnN = 0;
 let builds = 0, buildLimit = BUILD_MAX, buildT0 = 0, buildOver = false;
 const nulls = (len: number): (Path2D | null)[] => Array.from({ length: len }, () => null);
 const linkPaths = nulls(16), dotPaths = nulls(12), litDots = nulls(12), speckPaths = nulls(16), smallPaths = nulls(16), haloPaths = nulls(16);
+/// family-top rings of the current group (screen centre, radius, style key), stroked by fillSpecks
+/// one path per style key; preallocated, so a frame allocates nothing for them
+const RING_CAP = 8192; // ~1.9 k families on 2026-10-19; room to grow before a top loses its ring at fit
+const ringX = new Float32Array(RING_CAP), ringY = new Float32Array(RING_CAP), ringR = new Float32Array(RING_CAP), ringK = new Uint8Array(RING_CAP);
+let ringN = 0, ringKeys = 0;
+/// the hovered / selected / focused bubbles of this frame, drawn after every other bubble
+const specI = new Int32Array(4), specX = new Float32Array(4), specY = new Float32Array(4), specR = new Float32Array(4), specA = new Float32Array(4);
+let specN = 0;
 /// link size class and ambient dots drawn this frame, per cluster index (classes rebuilt when the
 /// store's cluster list is replaced)
 let famOf: Cluster[] | null = null, famLen = 0, famClass = new Uint8Array(0), famDots = new Uint16Array(0);
@@ -419,13 +442,21 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
   // ---- trade fx: ripples, flashes and comets under the bubbles
   s.perf.fx = drawFx(ctx, s.fx, st, s.sprites, k, tx, ty, w, h, now, s.static);
 
-  // ---- bubbles, smallest first so big bubbles and their labels sit on top. Under a highlight the
+  // ---- bubbles: everything but the family tops, then the tops, each smallest first so big bubbles
+  // and their labels sit on top; the hovered / selected / focused ones last. Under a highlight the
   // dimmed non-matches go first and the matches over them (two globalAlpha levels per frame).
   curAlpha = 1; ctx.globalAlpha = 1;
-  drawnN = 0; beaconN = 0;
+  drawnN = 0; beaconN = 0; specN = 0; ringN = 0; ringKeys = 0;
   for (let q = 0; q < 16; q++) speckPaths[q] = null;
-  if (hl) { bubblePass(ctx, s, 1); fillSpecks(ctx); bubblePass(ctx, s, 2); }
-  else { bubblePass(ctx, s, 0); fillSpecks(ctx); }
+  const ts = st.topStart <= n ? st.topStart : n;
+  if (hl) { bubblePass(ctx, s, 1, 0, ts); fillSpecks(ctx); bubblePass(ctx, s, 1, ts, n); fillSpecks(ctx); bubblePass(ctx, s, 2, 0, ts); fillSpecks(ctx); bubblePass(ctx, s, 2, ts, n); fillSpecks(ctx); }
+  else { bubblePass(ctx, s, 0, 0, ts); fillSpecks(ctx); bubblePass(ctx, s, 0, ts, n); fillSpecks(ctx); }
+  for (let q = 0; q < specN; q++) {
+    const i = specI[q], a = specA[q];
+    if (a !== curAlpha) { ctx.globalAlpha = a; curAlpha = a; }
+    slowPath(ctx, s, i, specX[q], specY[q], specR[q], i === hov, (flags[i] & F_FOCUS) !== 0, a);
+  }
+  specN = 0;
   if (curAlpha !== 1) { ctx.globalAlpha = 1; curAlpha = 1; }
   s.perf.drawn = drawnN;
 
@@ -456,8 +487,12 @@ export function draw(ctx: CanvasRenderingContext2D, s: State, tip: HTMLDivElemen
   s.perf.titles = s.focus ? 0 : titlePass(ctx, s, hc);
   const minWorldR = LABEL_R / k;
   const always = ALWAYS_LABELS;
-  for (let oi = n - 1; oi >= 0 && labelsN < MAX_LABELS; oi--) {
-    const i = order[oi];
+  // biggest first: the draw order is two sorted runs (the tops from ts on, everything else before),
+  // walked from their ends and merged by radius (a tie goes to the top)
+  const rTs = st.rT;
+  let oa = ts - 1, ob = n - 1;
+  while (labelsN < MAX_LABELS && (oa >= 0 || ob >= ts)) {
+    const i = ob >= ts && (oa < 0 || rTs[order[ob]] >= rTs[order[oa]]) ? order[ob--] : order[oa--];
     if (i === hov || i === SEL || i === s.focusIdx) continue;
     if (hl && !(flags[i] & F_MATCH)) continue;
     const srT = st.rT[i] * k;
@@ -577,6 +612,16 @@ function litLinks(ctx: CanvasRenderingContext2D, s: State, hov: number, speed: n
 
 function fillSpecks(ctx: CanvasRenderingContext2D) {
   if (curAlpha !== 1) { ctx.globalAlpha = 1; curAlpha = 1; }
+  if (ringN) {
+    ctx.lineWidth = TOP_RING_W;
+    for (let key = 0; key < 16; key++) {
+      if (!(ringKeys & (1 << key))) continue;
+      ctx.beginPath();
+      for (let q = 0; q < ringN; q++) if (ringK[q] === key) { ctx.moveTo(ringX[q] + ringR[q], ringY[q]); ctx.arc(ringX[q], ringY[q], ringR[q], 0, TAU); }
+      ctx.strokeStyle = TOP_RING[key]; ctx.stroke();
+    }
+    ringN = 0; ringKeys = 0;
+  }
   for (let key = 0; key < 16; key++) { const p = haloPaths[key]; if (p) { ctx.fillStyle = SMALL_HALO[key]; ctx.fill(p); haloPaths[key] = null; } }
   // 1 px, not more: Skia strokes up to one device pixel wide on its hairline path, which costs a
   // fraction of the general stroker in software raster. At 1.1 px the thousands of small rings took
@@ -586,13 +631,14 @@ function fillSpecks(ctx: CanvasRenderingContext2D) {
   for (let key = 0; key < 16; key++) { const p = speckPaths[key]; if (p) { ctx.fillStyle = SPECK_STYLE[key]; ctx.fill(p); speckPaths[key] = null; } }
 }
 
-/// One pass over the draw order. which: 0 every node, 1 highlight non-matches (dimmed), 2 matches.
-function bubblePass(ctx: CanvasRenderingContext2D, s: State, which: 0 | 1 | 2) {
-  const st = s.store, n = st.n;
-  const { x, y, r, order, flags, color, rel, born, pulse, gen } = st;
+/// One pass over order[from, to). which: 0 every node, 1 highlight non-matches (dimmed), 2 matches.
+/// The hovered / selected / focused bubbles are only recorded (specI…), for the caller to draw last.
+function bubblePass(ctx: CanvasRenderingContext2D, s: State, which: 0 | 1 | 2, from: number, to: number) {
+  const st = s.store;
+  const { x, y, r, order, flags, color, rel, born, pulse, gen, top } = st;
   const k = K, tx = TX, ty = TY, w = W, h = H, now = NOW, hov = HOV, sel = SEL;
-  const sprites = s.sprites;
-  for (let oi = 0; oi < n; oi++) {
+  const sprites = s.sprites, tops = !s.focus;
+  for (let oi = from; oi < to; oi++) {
     const i = order[oi];
     const fl = flags[i];
     if (which !== 0 && ((fl & F_MATCH) !== 0) !== (which === 2)) continue;
@@ -630,9 +676,14 @@ function bubblePass(ctx: CanvasRenderingContext2D, s: State, which: 0 | 1 | 2) {
     if (a !== curAlpha) { ctx.globalAlpha = a; curAlpha = a; }
     const bits = (fl & F_ANC ? SB_ANC : 0) | (fl & F_MIG ? SB_MIG : 0);
     const ci = color[i];
-    if (on || isFocus || i === sel) { slowPath(ctx, s, i, sx, sy, sr, on, isFocus, a); continue; }
+    if (on || isFocus || i === sel) { if (specN < 4) { specI[specN] = i; specX[specN] = sx; specY[specN] = sy; specR[specN] = sr; specA[specN] = a; specN++; } continue; }
+    const isTop = tops && top[i] === 1;
+    if (isTop && ringN < RING_CAP) {
+      const key = ((hdim ? 1 : 0) + (ldim ? 2 : 0)) * 4 + ci;
+      ringX[ringN] = sx; ringY[ringN] = sy; ringR[ringN] = sr + topGap(sr); ringK[ringN] = key; ringN++; ringKeys |= 1 << key;
+    }
     const ri = bucketR(sr);
-    if (sr < SMALL_R) {
+    if (sr < (isTop ? TOP_LOGO_R : SMALL_R)) {
       // small tier: batched vectors (a blit costs ~3.5 µs in software raster, an arc in a shared
       // path a fraction of that): halo + body + ring per colour and dim level, flushed with the specks
       if (!(bits & SB_ANC)) {
@@ -649,7 +700,7 @@ function bubblePass(ctx: CanvasRenderingContext2D, s: State, which: 0 | 1 | 2) {
       continue;
     }
     const d = st.data[i];
-    const img = sr >= IMG_R && d.image ? imgFor(d.image, Math.ceil(2 * sr * DPR)) : null;
+    const img = sr >= (isTop ? TOP_LOGO_R : IMG_R) && d.image ? imgFor(d.image, Math.ceil(2 * sr * DPR)) : null;
     if (ri > MAX_SPRITE_R) { drawBig(ctx, s, i, sx, sy, sr, img, bits); continue; }
     let sp: HTMLCanvasElement | null = null, spR = ri;
     if (img) {
@@ -710,13 +761,14 @@ function slowPath(ctx: CanvasRenderingContext2D, s: State, i: number, sx: number
   ctx.globalAlpha = on ? 1 : 0.9; ctx.drawImage(glow, sx - gw / 2, sy - gw / 2, gw, gw); ctx.globalAlpha = a; curAlpha = a;
   ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI * 2);
   ctx.fillStyle = ca(tab, on ? 0.34 : 0.2); ctx.fill();
-  const img = sr >= 7 ? imgFor(d.image, Math.ceil(2 * sr * DPR)) : null;
+  const logoR = !s.focus && st.top[i] ? TOP_LOGO_R : 7;
+  const img = sr >= logoR ? imgFor(d.image, Math.ceil(2 * sr * DPR)) : null;
   if (img) {
     ctx.save(); ctx.beginPath(); ctx.arc(sx, sy, sr - 0.5, 0, Math.PI * 2); ctx.clip();
     ctx.drawImage(img, sx - sr, sy - sr, sr * 2, sr * 2);
     ctx.fillStyle = ca(tab, on ? 0.08 : 0.14); ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
     ctx.restore();
-  } else if (sr >= 7) {
+  } else if (sr >= logoR) {
     ctx.fillStyle = COLORS[ci]; ctx.font = letterFont(Math.max(9, Math.round(sr * 0.9))); ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(String.fromCharCode(st.letterCode(i)), sx, sy + 0.5);
   }
@@ -724,6 +776,7 @@ function slowPath(ctx: CanvasRenderingContext2D, s: State, i: number, sx: number
   ctx.strokeStyle = on ? "#ffffff" : ca(tab, anc ? 0.95 : 0.8); ctx.lineWidth = on ? 2 : isFocus ? 1.6 : 1.1;
   if (anc) ctx.setLineDash([4, 4]);
   ctx.stroke(); ctx.setLineDash([]);
+  if (!s.focus && st.top[i]) { ctx.beginPath(); ctx.arc(sx, sy, sr + topGap(sr), 0, Math.PI * 2); ctx.strokeStyle = ca(tab, 0.5); ctx.lineWidth = TOP_RING_W; ctx.stroke(); }
   if (st.flags[i] & F_MIG && sr >= 7) drawCap(ctx, sx, sy, sr);
   if (isFocus || i === SEL) {
     // slowly rotating dashed accent ring marks "you are here" / the selection
@@ -786,13 +839,15 @@ function putLabel(ctx: CanvasRenderingContext2D, s: State, i: number, big: boole
 
 /// Cluster titles at overview zoom: biggest trees first, each above its tree's top edge, culled
 /// against each other and the forced labels; the active tree's title always shows (lime). A title
-/// fades out as its root grows big enough to carry its own label, and suppresses that label meanwhile.
+/// fades in with its tree's screen size and goes once the tree is over TITLE_MAX_R; while it shows
+/// and the top is under LABEL_R it stands in for the top's label (from LABEL_R on the top keeps it).
 function titlePass(ctx: CanvasRenderingContext2D, s: State, hc: number): number {
   const st = s.store, cl = st.clusters, order = st.titleOrder, perf = s.perf;
   const compact = W < 600;
   const maxT = Math.min(perf.titleIdx.length, compact ? MAX_TITLES_PHONE : MAX_TITLES);
-  // narrow screens: trees are smaller at fit, so titles (ticker only) start at 10 px instead of 14
-  const lo = compact ? 10 : 14, full = compact ? 16 : 22;
+  // narrow screens: trees are smaller at fit, so titles (ticker only) start at 8 px instead of 14
+  // (the ten largest trees sit around 9–13 px at a phone's fit once family tops weigh their family)
+  const lo = compact ? 8 : 14, full = compact ? 14 : 22;
   let shown = 0;
   const one = (ci: number, active: boolean) => {
     const c = cl[ci];
@@ -800,10 +855,10 @@ function titlePass(ctx: CanvasRenderingContext2D, s: State, hc: number): number 
     const scr = c.cr * K;
     const rootR = st.r[c.root] * K;
     let a: number;
-    if (active) { if (scr < 6 || rootR >= 20) return; a = 1; }
+    if (active) { if (scr < 6 || scr > TITLE_MAX_R) return; a = 1; }
     else {
-      if (scr < lo || scr > 260) return;
-      a = smoothstep(lo, full, scr) * (1 - smoothstep(12, 20, rootR));
+      if (scr < lo || scr > TITLE_MAX_R) return;
+      a = smoothstep(lo, full, scr);
       if (a < 0.05) return;
     }
     if (c.tspText !== c.title || c.tspC !== compact) { c.tsp = null; c.tspA = null; c.tspText = c.title; c.tspC = compact; c.tspW = titleWidth(c.title, compact); }
@@ -827,7 +882,7 @@ function titlePass(ctx: CanvasRenderingContext2D, s: State, hc: number): number 
     ctx.drawImage(sp, Math.round(ax - sp.width / 2), Math.round(ay - sp.height));
     ctx.globalAlpha = 1;
     perf.titleIdx[shown++] = ci;
-    if (a > 0.5 && suppN < suppList.length) { supp[c.root] = 1; suppList[suppN++] = c.root; }
+    if (a > 0.5 && rootR < LABEL_R && suppN < suppList.length) { supp[c.root] = 1; suppList[suppN++] = c.root; }
   };
   if (hc >= 0) one(hc, true);
   for (let q = 0; q < order.length && shown < maxT; q++) { const ci = order[q]; if (ci !== hc) one(ci, false); }

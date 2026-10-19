@@ -6,12 +6,18 @@
 //   Float32Arrays; buffers are returned after each frame, so steady state allocates nothing on either
 //   side. The draw loop interpolates between the last two worker frames, so a 50 ms worker tick at
 //   20 k nodes still moves bubbles at 60 fps. Clusters are placed once with d3.packSiblings (one circle
-//   per root); a root that arrives later gets a spot on the periphery, never a re-pack.
+//   per root); a root that arrives later gets a spot on the periphery, never a re-pack. Each family's
+//   top is pulled to its cluster centre and every member is kept outside the top's disc.
+// - Sizes (lib/map/sizing.ts, owner 2026-10-19 "like Bubblemaps"): area ∝ weight on one scale for the
+//   whole map; a family top (a SOL root or a listed asset) weighs its whole family, so it is the
+//   biggest bubble of its tree (≥ 1.5× its largest member) and its size compares trees. The coin page
+//   (focus) keeps per-coin sizes.
 // - Store: structure-of-arrays (map/store.ts): x/y/r in Float32Arrays, flags/colour/depth in byte
-//   arrays, draw order as an Int32Array sorted by radius, CSR child lists for hover highlighting, per-
-//   cluster title anchors (centroid, enclosing radius, top edge) and hull polygons of the 60 largest
-//   clusters in preallocated arrays (refreshed on worker frames, not per draw), and the live activity
-//   per node (`lastTrade` epoch ms, `t1h` trades in the last hour).
+//   arrays, draw order as an Int32Array sorted by radius (family tops after everything else), CSR
+//   child lists for hover highlighting, per-cluster title anchors (centroid, enclosing radius, top
+//   edge) and hull polygons of the 60 largest clusters in preallocated arrays (refreshed on worker
+//   frames, not per draw), and the live activity per node (`lastTrade` epoch ms, `t1h` trades in the
+//   last hour).
 // - Draw (map/draw.ts): offscreen culling, three tiers by on-screen radius (specks batched into a
 //   few Path2D fills, shared sprites per colour+size, per-node sprites with the glow baked in and the
 //   logo once it loads), links batched per colour and skipped into specks, labels from cached bitmaps
@@ -54,6 +60,7 @@ import { imageFor, imageStats } from "../lib/map/images";
 import { DEBUG_HOOKS } from "../lib/map/debug";
 import type { HeatIndex } from "../lib/map/heat";
 import type { BubbleNode, SizeMode } from "../lib/map/types";
+import { familyRadii, familyWeights, families, rangeFor } from "../lib/map/sizing";
 import { ErrorBox, Skeleton, nameOf, sym } from "./Bits";
 import { clusterAt, draw, fitFor, hitTest, makeState, screenR, TWEEN_MS, type Inset, type State } from "./map/draw";
 import { cancelFlight, contextTarget, flyTo } from "./map/camera";
@@ -136,7 +143,9 @@ const CAMERA_HZ_MS = 250;
 const pct = (arr: Float32Array, n: number, p: number) => { if (!n) return 0; const a = Array.from(arr.subarray(0, Math.min(n, arr.length))).sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(a.length * p))]; };
 const stat = (arr: Float32Array, n: number) => { const len = Math.min(n, arr.length); let sum = 0, max = 0; for (let i = 0; i < len; i++) { sum += arr[i]; if (arr[i] > max) max = arr[i]; } return { n, avg: len ? sum / len : 0, p95: pct(arr, n, 0.95), max }; };
 
-type Scale = { maxV: number; maxR: number; floor: number; mode: SizeMode; focus: string | undefined; count: number };
+/// maxV = the heaviest weight (value, or a top's family total) drawn at radius rangeR; maxR = the base
+/// largest radius (the coin page's scale, and the fallback for coins with no known value).
+type Scale = { maxV: number; maxR: number; rangeR: number; floor: number; mode: SizeMode; focus: string | undefined; count: number };
 
 /// Uploads nodes [from, n) and their links to the worker: "init" rebuilds the simulation, "add" appends.
 /// Arrays are copies, transferred, so the store keeps its own.
@@ -335,18 +344,29 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     const hasAnc = !!focusNode && nodes.some((n) => n.depth < focusNode.depth);
     s.hPx = hPx; s.hasAnc = hasAnc;
 
-    // Radius scale: kept across small changes so a live insert does not resize the whole map; recomputed
-    // when the mode/focus changes, the set grows a lot, or the largest value moves by more than 15 %.
-    let maxV = 1; for (const n of nodes) { const v = valueOf(n, mode) ?? 0; if (v > maxV) maxV = v; }
+    // Radius scale (lib/map/sizing.ts): area ∝ weight on one scale for the whole map, and off the coin
+    // page a family top weighs its whole family, so it is the biggest bubble of its tree. Kept across
+    // small changes so a live insert does not resize the whole map; recomputed when the mode/focus
+    // changes, the set grows a lot, or the heaviest weight moves by more than 15 %.
+    const fam = focus ? null : families(nodes);
+    const wts = fam ? familyWeights(nodes, fam, mode) : null;
+    let maxV = 1;
+    if (wts) { for (let q = 0; q < wts.length; q++) if (wts[q] > maxV) maxV = wts[q]; }
+    else for (const n of nodes) { const v = valueOf(n, mode) ?? 0; if (v > maxV) maxV = v; }
     const sc = scale.current;
     const rescale = !sc || sc.mode !== mode || sc.focus !== focus || maxV > sc.maxV * 1.15 || maxV < sc.maxV * 0.6 || nodes.length > sc.count * 1.5 || nodes.length < sc.count * 0.6;
     if (rescale) {
       const maxR = focus ? Math.max(18, Math.min(44, hPx / 11)) : Math.max(18, Math.min(52, hPx / (nodes.length > 150 ? 16 : nodes.length > 60 ? 13 : 10)));
-      scale.current = { maxV, maxR, floor: nodes.length > 150 ? 5 : 7, mode, focus, count: nodes.length };
+      const floor = nodes.length > 150 ? 5 : 7;
+      const rangeR = fam && wts ? rangeFor(fam, wts, { maxW: maxV, floor, maxR }) : maxR;
+      scale.current = { maxV, maxR, rangeR, floor, mode, focus, count: nodes.length };
     }
-    const { maxR, floor } = scale.current!;
+    const { maxR, floor, rangeR } = scale.current!;
+    const radii = fam && wts ? familyRadii(fam, wts, { maxW: scale.current!.maxV, rangeR, floor, maxR }) : null;
     const rScale = scaleSqrt().domain([0, scale.current!.maxV]).range([0, maxR]);
-    const radiusOf = (d: BubbleNode) => {
+    /// node `d` at position `q` of `nodes`
+    const radiusOf = (d: BubbleNode, q: number) => {
+      if (radii) return radii[q];
       const v = valueOf(d, mode);
       const anc = !!focusNode && d.depth < focusNode.depth && d.mint !== focus;
       let r = v == null ? maxR * (anc ? 0.55 : 0.4) : Math.max(floor, rScale(v));
@@ -382,7 +402,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     for (let q = 0; q < nodes.length; q++) {
       const d = nodes[q];
       let i = store.idx.get(d.mint);
-      const r = radiusOf(d);
+      const r = radiusOf(d, q);
       if (i === undefined) {
         const hasPos = d.x != null && d.y != null && Number.isFinite(d.x) && Number.isFinite(d.y);
         if (hasPos) hadPositions++;
@@ -400,7 +420,6 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
       }
       idxOf[q] = i;
     }
-    if (rescale && !added.length) { for (let i = 0; i < store.n; i++) { const r = radiusOf(store.data[i]); if (Math.abs(store.rT[i] - r) > 0.25) { store.r0[i] = store.r[i]; store.rT[i] = r; store.rt0[i] = now; radiiChanged++; } } }
     if (!store.n) { s.focusIdx = -1; return; }
     const parentChanged = !added.length && nodes.some((d, q) => { const pi = d.parentMint ? store.idx.get(d.parentMint) : undefined; return (pi ?? -1) !== store.parent[idxOf[q]]; });
     if (added.length || parentChanged) store.rebuildLinks();
@@ -475,17 +494,23 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
     }
     if (radiiChanged) {
       s.tweenUntil = now + TWEEN_MS + 30;
-      if (w && !added.length) {
+      // The worker learns the new radii of the bubbles it already has: after a cold start or a rebuild
+      // the "init" carried every radius; next to an "add" (a new coin grows its family's top) only the
+      // existing ones are sent.
+      if (w && (!added.length || (!cold && !removed))) {
+        const upto = added.length ? oldN : store.n;
         const idxL: number[] = []; let maxD = 0;
-        for (let i = 0; i < store.n; i++) if (store.rt0[i]) { idxL.push(i); const dd = Math.abs(store.rT[i] - store.r0[i]); if (dd > maxD) maxD = dd; }
-        const idx = Int32Array.from(idxL), r = new Float32Array(idx.length);
-        for (let q = 0; q < idx.length; q++) r[q] = store.rT[idx[q]];
-        // A mode change re-sizes everything (real reheat); a live value tick only needs a nudge, and a
-        // sub-pixel one needs none: the worker just learns the new collision radii.
-        const alpha = rescale ? 0.3 : maxD > 1.5 ? 0.02 : 0;
-        if (alpha > 0) { store.settled = false; store.tickAt = 0; }
-        // a live tick relaxes only the changed bubbles' neighbourhood (the worker pins the rest)
-        w.postMessage({ t: "radius", idx, r, alpha, global: rescale }, [idx.buffer, r.buffer]);
+        for (let i = 0; i < upto; i++) if (store.rt0[i]) { idxL.push(i); const dd = Math.abs(store.rT[i] - store.r0[i]); if (dd > maxD) maxD = dd; }
+        if (idxL.length) {
+          const idx = Int32Array.from(idxL), r = new Float32Array(idx.length);
+          for (let q = 0; q < idx.length; q++) r[q] = store.rT[idx[q]];
+          // A mode change re-sizes everything (real reheat); a live value tick only needs a nudge, and a
+          // sub-pixel one needs none: the worker just learns the new collision radii.
+          const alpha = rescale ? 0.3 : maxD > 1.5 ? 0.02 : 0;
+          if (alpha > 0) { store.settled = false; store.tickAt = 0; }
+          // a live tick relaxes only the changed bubbles' neighbourhood (the worker pins the rest)
+          w.postMessage({ t: "radius", idx, r, alpha, global: rescale }, [idx.buffer, r.buffer]);
+        }
       }
       if (rescale) { for (const c of store.clusters) { let mx = 0; for (const i of c.members) if (store.rT[i] > mx) mx = store.rT[i]; c.maxR = mx; } }
     }
@@ -719,7 +744,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
   const worldRadius = useCallback((value: number) => {
     const sc = scale.current;
     if (!sc || !(value > 0)) return sc?.floor ?? 0;
-    return Math.max(sc.floor, Math.sqrt(value / Math.max(1e-9, sc.maxV)) * sc.maxR);
+    return Math.max(sc.floor, Math.sqrt(value / Math.max(1e-9, sc.maxV)) * sc.rangeR);
   }, []);
   const zoomK = useCallback(() => st.current.t.k, []);
   const frameStats = useCallback((): FrameStats => { const p = st.current.perf; return { frames: p.frames, settling: stat(p.settling, p.sn), settled: stat(p.settled, p.dn), labels: p.labels, drawn: p.drawn }; }, []);
@@ -880,7 +905,7 @@ export default function BubbleMap({ nodes, focus, select: selectProp, onSelect, 
           <span><i style={{ background: hexA(COLORS[0], .25), borderColor: COLORS[0] }} /> root</span>
           <span><i style={{ background: hexA(COLORS[1], .25), borderColor: COLORS[1] }} /> d1</span>
           <span><i style={{ background: hexA(COLORS[2], .25), borderColor: COLORS[2] }} /> d2</span>
-          <span className="muted bm-legend-note" title="Dots travel from child to parent the way buys do: every buy of a child buys its parent first.">area = {mode === "locked" ? "locked value" : "market cap"}</span>
+          <span className="muted bm-legend-note" title={`Dots travel from child to parent the way buys do: every buy of a child buys its parent first.${focus ? "" : " A tree's centre bubble is sized by its whole family."}`}>area = {mode === "locked" ? "locked value" : "market cap"}</span>
         </div>
       )}
     </div>

@@ -4,6 +4,11 @@
 // is allocated on either side. Forces mirror the single-thread map this replaced: links to the parent,
 // a short-range charge, collision with padding, and a pull toward the root's cluster centre.
 //
+// Family tops (a node with children and no parent link: worked out here from the links) are pulled to
+// their cluster centre harder than anything else, and every member of a family is kept outside its
+// top's disc (forceTops: a hard limit at r_top + r + TOP_GAP on the positions the tick integrates), so
+// the top sits in the middle of its family with the members orbiting it, never under them.
+//
 // Drag (rigid subtree): "dragstart" pins the moving nodes where they are (fx/fy) without touching
 // alpha, "translate" shifts them by the pointer's delta, "dragend" unpins them. A drag never reheats the
 // whole layout: when it is asleep, the drop is eased by a local simulation of the moved nodes as one
@@ -26,7 +31,7 @@
 // relaxes with the eased body held in place, so a drop never hesitates behind a live tick.
 import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, quadtree, type Quadtree, type Simulation } from "d3";
 
-type N = { index: number; x: number; y: number; vx: number; vy: number; fx?: number | null; fy?: number | null; r: number; cx: number; cy: number; depth: number; fixed: boolean };
+type N = { index: number; x: number; y: number; vx: number; vy: number; fx?: number | null; fy?: number | null; r: number; cx: number; cy: number; depth: number; fixed: boolean; top?: boolean };
 type L = { source: N; target: N };
 type Buf = { x: Float32Array; y: Float32Array };
 type InitMsg = { t: "init"; n: number; x: Float32Array; y: Float32Array; r: Float32Array; cx: Float32Array; cy: Float32Array; depth: Uint8Array; fixed: Uint8Array; src: Int32Array; dst: Int32Array; alpha: number; focus: boolean; hPx: number; ancShift: number };
@@ -60,6 +65,14 @@ const YIELD = 0.06;
 const PAD = 6, COLLIDE = 0.9, PUSH_MAX = 4;
 /// Neighbourhood relaxation: nodes within this distance (world units, rim to rim) of a changed node move.
 const NB_MARGIN = 90;
+/// The main simulation's velocity decay, and the share of a node's velocity a tick integrates (d3
+/// keeps 1 − decay of it: x += vx *= 1 − decay).
+const VEL_DECAY = 0.45, VEL_KEEP = 1 - VEL_DECAY;
+/// Pull of a family top (and of any other bubble at depth 0) toward its cluster centre, and of everything else.
+const TOP_PULL = 0.3, MEMBER_PULL = 0.06;
+/// Hard clearance between a family top's rim and a member's rim (world units; the soft collision keeps 12).
+const TOP_GAP = 4;
+const GOLDEN = 2.399963;
 
 /// Collisions between the body (prox[0, mn)) and everything else (prox[mn, end)) only. Pinned nodes do
 /// not move; a yielding one takes its share by area. Velocity-predicted positions, like forceCollide.
@@ -101,6 +114,8 @@ function bodyCollide(prox: N[], mn: number) {
 let sim: Simulation<N, L> | null = null;
 let nodes: N[] = [];
 let links: L[] = [];
+/// topOf[i] = node index of i's family top (i itself for a top or a lone bubble), from the links.
+let topOf = new Int32Array(0);
 let focus = false, hPx = 600, ancShift = 0;
 let free: Buf[] = [];
 let running = false;
@@ -146,11 +161,44 @@ function applyForces(s: Simulation<N, L>, ls: L[], count: number) {
   s.force("charge", forceManyBody<N>().strength((d) => -Math.max(30, d.r * (focus ? 9 : 3.5))).distanceMax(focus ? 420 : 140).theta(1.1));
   s.force("collide", forceCollide<N>().radius((d) => d.r + 6).strength(0.9).iterations(count > 8000 ? 1 : 2));
   applyPull(s);
+  // last, so it sees this tick's final velocities (d3 runs forces in the order they were added)
+  s.force("tops", focus ? null : forceTops);
 }
 /// The pull toward each node's cluster centre (d3 caches the targets: re-applied when a centre moves).
 function applyPull(s: Simulation<N, L>) {
-  s.force("x", forceX<N>((d) => d.cx).strength((d) => (d.depth === 0 && !focus ? 0.25 : 0.06)));
-  s.force("y", forceY<N>((d) => d.cy + (ancShift && !d.fixed ? hPx * 0.1 : 0)).strength((d) => (d.depth === 0 && !focus ? 0.25 : 0.06)));
+  const pull = (d: N) => ((d.top || d.depth === 0) && !focus ? TOP_PULL : MEMBER_PULL);
+  s.force("x", forceX<N>((d) => d.cx).strength(pull));
+  s.force("y", forceY<N>((d) => d.cy + (ancShift && !d.fixed ? hPx * 0.1 : 0)).strength(pull));
+}
+/// Family tops and topOf from the links (after every init/add). O(nodes + links), allocation per call only.
+function retop() {
+  const n = nodes.length;
+  const par = new Int32Array(n).fill(-1), kids = new Uint8Array(n);
+  for (const l of links) { par[l.target.index] = l.source.index; kids[l.source.index] = 1; }
+  if (topOf.length < n) topOf = new Int32Array(n + (n >> 2) + 64);
+  for (let i = 0; i < n; i++) { let cur = i, hops = 0; while (par[cur] >= 0 && hops++ < 16) cur = par[cur]; topOf[i] = cur; nodes[i].top = par[i] < 0 && kids[i] === 1; }
+}
+/// Keeps every family member's centre (and rim) outside its top's disc: a member nearer to its top than
+/// r_top + r + TOP_GAP, on the positions this tick is about to integrate, is moved out along the line
+/// between them to exactly that distance. A pinned member is left alone (a drag, a neighbourhood
+/// relaxation); a pinned top still pushes. O(nodes) per tick, nothing allocated.
+function forceTops() {
+  const n = nodes.length;
+  for (let i = 0; i < n; i++) {
+    const t = topOf[i];
+    if (t === i || t < 0 || t >= n) continue;
+    const d = nodes[i];
+    if (d.fx != null) continue;
+    const T = nodes[t];
+    const tx = T.fx != null ? T.fx : T.x + T.vx * VEL_KEEP, ty = T.fy != null ? T.fy : T.y + T.vy * VEL_KEEP;
+    let dx = d.x + d.vx * VEL_KEEP - tx, dy = d.y + d.vy * VEL_KEEP - ty;
+    const min = T.r + d.r + TOP_GAP, l2 = dx * dx + dy * dy;
+    if (l2 >= min * min) continue;
+    let l = Math.sqrt(l2);
+    if (l < 1e-6) { dx = Math.cos(i * GOLDEN); dy = Math.sin(i * GOLDEN); l = 1; }
+    const k = (min - l) / l;
+    d.x += dx * k; d.y += dy * k;
+  }
 }
 function forces() { if (sim) applyForces(sim, links, nodes.length); }
 
@@ -379,7 +427,8 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       running = false; nodes = []; links = []; free = []; drag = null; local = null; nbPin = null; dragMark = null; bodyAfterLocal = null; deferred = null; paused = false; global = false;
       focus = m.focus; hPx = m.hPx; ancShift = m.ancShift;
       build(m, 0);
-      sim = forceSimulation<N, L>(nodes).stop().alphaDecay(nodes.length > 8000 ? 0.05 : 0.04).velocityDecay(0.45).alphaMin(ALPHA_MIN).alpha(0);
+      retop();
+      sim = forceSimulation<N, L>(nodes).stop().alphaDecay(nodes.length > 8000 ? 0.05 : 0.04).velocityDecay(VEL_DECAY).alphaMin(ALPHA_MIN).alpha(0);
       forces();
       if (m.alpha >= ALPHA_MIN) start(m.alpha); else post(true);
       break;
@@ -388,6 +437,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       if (!sim) return;
       const base = nodes.length;
       build(m, base);
+      retop();
       sim.nodes(nodes);
       forces();
       // a node being dragged stays pinned through the re-initialisation; the newcomers relax with their

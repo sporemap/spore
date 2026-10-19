@@ -4,11 +4,15 @@
 // missing or broken IndexedDB (private mode, storage pressure) and the caller falls back to the network.
 // Two more meta records live beside "map" and are never touched by saveNodes: "seen" (when the previous
 // visit ended, for "since your last visit") and "full" (when the cache last held a complete full load,
-// so a warm cache whose USD values drifted is re-synced in full every FULL_EVERY_MS).
+// so a warm cache whose USD values drifted is re-synced in full every FULL_EVERY_MS). A third, "layout",
+// stamps the positions with the layout rule they were settled under (LAYOUT_V): positions of an older
+// rule are dropped on read (the nodes stay), so the next open lays the map out once with today's sizes.
 import type { BubbleNode } from "./types";
 
 /// Bump when the record shape changes: the upgrade handler drops every store, so an old cache is cleared.
 export const CACHE_V = 3; // 3: listed-asset families (PUMP, USDC, $baton…) sit above their coins — old caches hold those coins as separate roots
+/// Bump when bubble sizes or layout forces change enough that a settled layout no longer fits them.
+export const LAYOUT_V = 2; // 2: family tops weigh their whole family and members orbit outside them (2026-10-19)
 const DB_NAME = "spore-map";
 const CHUNK = 2500;
 
@@ -48,17 +52,20 @@ export async function loadCache(): Promise<CachedMap | null> {
     const db = await open();
     if (!db) return null;
     const tx = db.transaction(["nodes", "pos", "meta"], "readonly");
-    const [nodes, pos, meta, seen, full] = await Promise.all([
+    const [nodes, pos, meta, seen, full, layout] = await Promise.all([
       req(tx.objectStore("nodes").getAll() as IDBRequest<BubbleNode[]>),
       req(tx.objectStore("pos").getAll() as IDBRequest<Pos[]>),
       req(tx.objectStore("meta").get("map") as IDBRequest<(CacheMeta & { key: string }) | undefined>),
       req(tx.objectStore("meta").get("seen") as IDBRequest<Stamp | undefined>),
       req(tx.objectStore("meta").get("full") as IDBRequest<Stamp | undefined>),
+      req(tx.objectStore("meta").get("layout") as IDBRequest<{ key: string; v?: number } | undefined>),
     ]);
     if (!meta || !nodes.length) return null;
-    const at = new Map<string, Pos>();
-    for (const p of pos) at.set(p.mint, p);
-    for (const n of nodes) { const p = at.get(n.mint); if (p) { n.x = p.x; n.y = p.y; } }
+    if (layout?.v === LAYOUT_V) {
+      const at = new Map<string, Pos>();
+      for (const p of pos) at.set(p.mint, p);
+      for (const n of nodes) { const p = at.get(n.mint); if (p) { n.x = p.x; n.y = p.y; } }
+    } else if (pos.length) void dropPositions(db);
     return { nodes, meta: { generatedAt: meta.generatedAt, savedAt: meta.savedAt, count: meta.count, seenAt: stampAt(seen), fullAt: stampAt(full) } };
   } catch { return null; }
 }
@@ -118,14 +125,22 @@ export async function saveNodes(nodes: BubbleNode[], generatedAt: number | null,
   } catch { /* cache is best effort */ }
 }
 
+/// Positions settled under an older layout rule: the store is emptied (best effort; the reader already
+/// ignored them).
+async function dropPositions(db: IDBDatabase): Promise<void> {
+  try { const tx = db.transaction("pos", "readwrite"); tx.objectStore("pos").clear(); await done(tx); } catch { /* best effort */ }
+}
+
+/// Upserts positions in chunks; every chunk also stamps the store with LAYOUT_V.
 export async function savePositions(pos: Pos[]): Promise<void> {
   try {
     const db = await open();
     if (!db) return;
     for (let i = 0; i < pos.length; i += CHUNK) {
-      const tx = db.transaction("pos", "readwrite");
+      const tx = db.transaction(["pos", "meta"], "readwrite");
       const st = tx.objectStore("pos");
       for (const p of pos.slice(i, i + CHUNK)) st.put(p);
+      tx.objectStore("meta").put({ key: "layout", v: LAYOUT_V });
       await done(tx);
     }
   } catch { /* best effort */ }

@@ -1,6 +1,7 @@
 // The /map key: what colours, rings, sizes and motion mean. Collapsed by default to one line (depth
 // swatches + "Key"); the size section draws three nested reference circles at 1-2-5 values at their TRUE
-// on-screen size for the current zoom (worldRadius(v) · k), so a bubble can be read against them.
+// on-screen size for the current zoom (worldRadius(v) · k), so a bubble can be read against them. A
+// tree's centre bubble (its top) is sized by the whole family's value (lib/map/sizing.ts).
 import { useState } from "react";
 import { usd } from "../../../lib/format";
 import type { SizeMode } from "../../../lib/map/types";
@@ -42,7 +43,7 @@ function SizeKey({ mode, cam, worldRadius }: { mode: SizeMode; cam: CamStore; wo
             {big.map((x, i) => { const y = H - 1 - 2 * x.r; const ty = labelY[i]; return <g key={x.v}><path d={`M${cx} ${y}H${cx + MAX_PX + 8}L${cx + MAX_PX + 12} ${ty - 3}`} /><text x={cx + MAX_PX + 16} y={ty}>{usd(x.v)}</text></g>; })}
           </svg>
         )}
-      <p className="map-key-note">true size at this zoom</p>
+      <p className="map-key-note">true size at this zoom · a tree's centre = its whole family</p>
     </section>
   );
 }
@@ -58,7 +59,7 @@ export default function MapKey({ mode, cam, worldRadius, variant = "dock", defau
       <section className="map-key-sec">
         <h4>Colour</h4>
         <ul className="map-key-list">
-          <li><Swatch d={0} /> root coin</li>
+          <li><Swatch d={0} /> root coin · ringed at its tree's centre</li>
           <li><Swatch d={1} /> d1 · paired under a root</li>
           <li><Swatch d={2} /> d2 · paired under a d1</li>
         </ul>

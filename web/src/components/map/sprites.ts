@@ -33,6 +33,7 @@ const trim = <K,>(m: Map<K, HTMLCanvasElement>, cap: number) => { if (m.size < c
 
 /// Bubble body at radius `ri` (integer, bucketed): glow, fill, image or letter, ring, dashed ancestor
 /// ring (SB_ANC) and the graduated cap (SB_MIG). `img` null = letter avatar (or plain when no letter).
+/// The logo or letter needs ri ≥ 6 (only a family top is drawn as a sprite that small: draw.ts).
 /// The Spore ring is not baked in: beacons are drawn by their own pass so they show at any size.
 export function renderBody(ri: number, color: string, img: CanvasImageSource | null, letter: string, bits: number, glow: boolean): HTMLCanvasElement {
   const ext = glow ? ri * GLOW : ri + 4;
@@ -48,13 +49,13 @@ export function renderBody(ri: number, color: string, img: CanvasImageSource | n
   }
   g.beginPath(); g.arc(x, y, ri, 0, Math.PI * 2);
   g.fillStyle = hexA(color, 0.2); g.fill();
-  if (img && ri >= 7) {
+  if (img && ri >= 6) {
     g.save(); g.beginPath(); g.arc(x, y, ri - 0.5, 0, Math.PI * 2); g.clip();
     g.drawImage(img, x - ri, y - ri, ri * 2, ri * 2);
     // tint keeps the bubble reading as a bubble, not a sticker
     g.fillStyle = hexA(color, 0.14); g.fillRect(x - ri, y - ri, ri * 2, ri * 2);
     g.restore();
-  } else if (ri >= 7 && letter) {
+  } else if (ri >= 6 && letter) {
     g.fillStyle = color; g.font = `600 ${Math.max(9, Math.round(ri * 0.9))}px ${MONO}`; g.textAlign = "center"; g.textBaseline = "middle";
     g.fillText(letter, x, y + 0.5);
   }

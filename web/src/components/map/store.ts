@@ -6,11 +6,15 @@
 // A drag moves a whole subtree rigidly: `beginDrag` collects it once (CSR walk) into `dragIds` and marks
 // `dragSet`, `translateDrag` shifts x/px/nx alike (so the interpolation cannot pull it back) and carries
 // the tree's centre, anchors and hull along, and `endDrag` clears the marks.
+// Family tops (a node with children and no parent on the map: a SOL root or a listed asset such as
+// $PUMP) are flagged in `top`, and the draw order puts every top after every other bubble (from
+// `topStart` on), so a family's top is never covered by its own children.
 // Per-node render caches (last sprite, label bitmap, letter) live here too, so a store rebuild drops
 // them together with the indices they belong to.
 import { packSiblings } from "d3";
 import { count as fmtCount } from "../../lib/format";
-import type { BubbleNode, SizeMode } from "../../lib/map/types";
+import type { BubbleNode } from "../../lib/map/types";
+export { valueOf } from "../../lib/map/sizing";
 
 // Depth palette: root lime, d1 mint, d2 violet, d3+ amber. Same order as the DepthBadge so a colour
 // means one thing everywhere on the site.
@@ -39,14 +43,6 @@ export type Cluster = {
 };
 /// Per-node render cache rings: once this many logo sprites / label bitmaps exist, the oldest is dropped.
 export const SPR_RING = 6000, LABEL_RING = 3000;
-
-// A leaf locks nothing, so in "locked" mode it is drawn by a slice of its market cap: visible, but
-// never bigger than the coins that actually hold value in their curves.
-export const valueOf = (d: BubbleNode, mode: SizeMode): number | null => {
-  if (mode === "mcap") return d.mcapUsd;
-  if (d.lockedUsd != null && d.lockedUsd > 0) return d.lockedUsd;
-  return d.mcapUsd != null ? d.mcapUsd * 0.15 : null;
-};
 
 export const letterOf = (symbol: string | null, name: string | null) => (symbol || name || "?").replace(/^\$/, "").slice(0, 1).toUpperCase();
 /// Ticker when there is one, else the on-chain name (never a bare mint when the coin has a name).
@@ -94,6 +90,8 @@ export class MapStore {
   /// Live activity: epoch ms of the node's last trade (0 = none) and trades in the last hour (saturating).
   lastTrade = new Float64Array(0); t1h = new Uint16Array(0);
   order = new Int32Array(0);
+  /// 1 = family top (children, no parent on the map); order[topStart, n) are the tops, smallest first.
+  top = new Uint8Array(0); topStart = 0;
   m = 0; lsrc = new Int32Array(0); ldst = new Int32Array(0); lseed = new Float32Array(0);
   childStart = new Int32Array(1); childList = new Int32Array(0);
   clusters: Cluster[] = []; clusterOf = new Map<string, number>();
@@ -128,7 +126,7 @@ export class MapStore {
     this.r = f32(this.r); this.rT = f32(this.rT); this.r0 = f32(this.r0); this.rt0 = f64(this.rt0); this.born = f64(this.born); this.pulse = f64(this.pulse);
     this.lastTrade = f64(this.lastTrade);
     const u8 = (a: Uint8Array) => { const b = new Uint8Array(cap); b.set(a); return b; };
-    this.depth = u8(this.depth); this.color = u8(this.color); this.flags = u8(this.flags); this.rel = u8(this.rel); this.dragSet = u8(this.dragSet);
+    this.depth = u8(this.depth); this.color = u8(this.color); this.flags = u8(this.flags); this.rel = u8(this.rel); this.dragSet = u8(this.dragSet); this.top = u8(this.top);
     this.sprBits = u8(this.sprBits); this.labelVariant = u8(this.labelVariant);
     const u16 = (a: Uint16Array) => { const b = new Uint16Array(cap); b.set(a); return b; };
     this.gen = u16(this.gen); this.t1h = u16(this.t1h); this.sprRi = u16(this.sprRi); this.sprGen = u16(this.sprGen); this.letter = u16(this.letter);
@@ -148,7 +146,7 @@ export class MapStore {
     this.r[i] = this.rT[i] = this.r0[i] = r; this.rt0[i] = 0;
     this.born[i] = now; this.pulse[i] = 0;
     this.depth[i] = Math.min(255, d.depth); this.color[i] = colorIdx(d.depth); this.flags[i] = flags | (d.ours ? F_OURS : 0) | (d.migrated ? F_MIG : 0); this.gen[i] = 0;
-    this.parent[i] = -1; this.cluster[i] = -1; this.rel[i] = 0;
+    this.parent[i] = -1; this.cluster[i] = -1; this.rel[i] = 0; this.top[i] = 0;
     this.lastTrade[i] = 0; this.t1h[i] = 0;
     this.spr[i] = null; this.sprImg[i] = null; this.sprRi[i] = 0; this.sprGen[i] = 0; this.sprBits[i] = 0;
     this.labelSp[i] = null; this.labelOwner[i] = null; this.labelVariant[i] = 0; this.letter[i] = 0; this.letterOwner[i] = null;
@@ -193,21 +191,24 @@ export class MapStore {
     const fill = start.slice();
     for (let i = 0; i < n; i++) if (this.parent[i] >= 0) list[fill[this.parent[i]]++] = i;
     this.childStart = start; this.childList = list;
+    for (let i = 0; i < n; i++) this.top[i] = this.parent[i] < 0 && start[i + 1] > start[i] ? 1 : 0;
   }
 
-  /// Draw order: small first so big bubbles and their labels sit on top; among equal radii the higher
-  /// generation first, so a family's top is drawn over (and hit before) same-size children piled on it
-  /// (a top with nothing locked sits at the floor radius in the middle of its children). Rebuilt when radii settle.
+  /// Draw order: every other bubble first, then the family tops; inside each part small first so big
+  /// bubbles and their labels sit on top, and among equal radii the higher generation first. A top is
+  /// thus drawn over (and hit before) anything that touches it. Rebuilt when radii settle.
   rebuildOrder() {
     const n = this.n;
     if (this.order.length !== n) this.order = new Int32Array(n);
     const o = this.order;
     for (let i = 0; i < n; i++) o[i] = i;
-    const rT = this.rT, depth = this.depth;
+    const rT = this.rT, depth = this.depth, top = this.top;
     // a typed array sort with a comparator is fine at 20k (~6 ms) and happens on data changes only
-    o.sort((a, b) => rT[a] - rT[b] || depth[b] - depth[a]);
-    let mx = 1; for (let i = 0; i < n; i++) if (rT[i] > mx) mx = rT[i];
+    o.sort((a, b) => top[a] - top[b] || rT[a] - rT[b] || depth[b] - depth[a]);
+    let mx = 1, tops = 0;
+    for (let i = 0; i < n; i++) { if (rT[i] > mx) mx = rT[i]; tops += top[i]; }
     this.maxR = mx;
+    this.topStart = n - tops;
   }
 
   rootOf(i: number): number { let cur = i, hops = 0; while (this.parent[cur] >= 0 && hops++ < 16) cur = this.parent[cur]; return cur; }

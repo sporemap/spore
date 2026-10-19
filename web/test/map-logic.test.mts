@@ -1,5 +1,6 @@
 // Pure logic of the map's data layer (DESIGN §11.5 "Map v2"): live pair counting, highlight keys and
-// counts, the rails, the "since your last visit" digest, share text and the full re-sync rule.
+// counts, the rails, the "since your last visit" digest, share text, the full re-sync rule and the
+// bubble sizes (family tops weigh their whole family).
 //
 //   node --import tsx --test test/map-logic.test.mts
 import { test } from "node:test";
@@ -10,6 +11,7 @@ import { railGrowing, railHot, railNew, railSpore, sinceDigest } from "../src/li
 import { mapLink, shareText } from "../src/lib/map/share.ts";
 import { applyTrade, indexHeat, type HeatIndex } from "../src/lib/map/heat.ts";
 import { FULL_EVERY_MS, needsFull } from "../src/lib/map/use-map-data.ts";
+import { TOP_GROW, TOP_LOG, TOP_MIN, TOP_RATIO, familyRadii, familyWeights, families, rangeFor, valueOf } from "../src/lib/map/sizing.ts";
 import type { BubbleNode } from "../src/lib/map/types.ts";
 import type { MapCoin } from "../src/lib/api.ts";
 
@@ -198,4 +200,82 @@ test("needsFull: never loaded, or the last complete load is older than 15 min", 
   assert.equal(needsFull(now - FULL_EVERY_MS, now), false);
   assert.equal(needsFull(now - FULL_EVERY_MS - 1, now), true);
   assert.equal(needsFull(now - 20 * 60_000, now), true);
+});
+
+// ---------------------------------------------------------------- sizes: family tops weigh their family
+test("families: tops, members and the walk to the top (an unknown parent makes a top)", () => {
+  const ns = [...fixture(), node("orphan", "nowhere", 1), node("o1", "orphan", 2)];
+  const f = families(ns);
+  const at = (m: string) => ns.findIndex((n) => n.mint === m);
+  assert.deepEqual([...f.top].map((q) => ns[q].mint), ["root", "root", "root", "root", "root", "root2", "root2", "orphan", "orphan"]);
+  assert.equal(f.members[at("root")], 5);
+  assert.equal(f.members[at("root2")], 2);
+  assert.equal(f.isTop[at("root")], 1);
+  assert.equal(f.isTop[at("orphan")], 1, "a coin whose parent is not on the map tops its family");
+  assert.equal(f.isTop[at("a")], 0);
+  assert.equal(f.parent[at("a1")], at("a"));
+  // a lone bubble is not a top
+  const lone = families([node("solo", null, 0)]);
+  assert.equal(lone.isTop[0], 0);
+});
+test("familyWeights: a top weighs its own value plus every descendant's, the rest their own", () => {
+  const ns = fixture();
+  const f = families(ns);
+  const w = familyWeights(ns, f, "locked");
+  const v = (m: string) => valueOf(ns.find((n) => n.mint === m)!, "locked")!;
+  const at = (m: string) => ns.findIndex((n) => n.mint === m);
+  assert.equal(w[at("root")], v("root") + v("a") + v("a1") + v("a2") + v("c"));
+  assert.equal(w[at("a")], 3_000);
+  assert.equal(w[at("a1")], Math.min(1_500 * 0.02, 500), "a leaf in locked mode: a small, capped slice of its mcap");
+  assert.equal(w[at("root2")], 5_000 + Math.min(300 * 0.02, 500));
+  const m = familyWeights(ns, f, "mcap");
+  assert.equal(m[at("root")], 90_000 + 12_000 + 1_500 + 800 + 2_000);
+  // no value at all: NaN for a member, 0 for a top
+  const bare = [node("t", null, 0, { mcapUsd: null }), node("k", "t", 1, { mcapUsd: null })];
+  const bw = familyWeights(bare, families(bare), "mcap");
+  assert.equal(bw[0], 0);
+  assert.ok(Number.isNaN(bw[1]));
+});
+test("familyRadii: area ∝ weight, the top is the largest of its tree, floors apply", () => {
+  // a top with two unclamped children and a crowd of tiny ones; a second family of 700 near-zero coins
+  const ns = [node("t", null, 0, { lockedUsd: 30_000 }), node("big", "t", 1, { lockedUsd: 10_000 }), node("mid", "t", 1, { lockedUsd: 2_500 }),
+    ...Array.from({ length: 30 }, (_, i) => node(`s${i}`, "t", 1, { lockedUsd: 1 })), node("crowd", null, 0, { lockedUsd: 1 }),
+    ...Array.from({ length: 700 }, (_, i) => node(`c${i}`, "crowd", 1, { lockedUsd: 0.5, mcapUsd: 1 })), node("x", "big", 2, { mcapUsd: null, lockedUsd: null })];
+  const f = families(ns), w = familyWeights(ns, f, "locked");
+  let maxW = 0; for (const v of w) if (v > maxW) maxW = v;
+  const sc = { maxW, rangeR: 200, floor: 5, maxR: 52 };
+  const r = familyRadii(f, w, sc);
+  const at = (m: string) => ns.findIndex((n) => n.mint === m);
+  // proportional: the heaviest weight sits at rangeR, others by sqrt of their share
+  assert.ok(Math.abs(r[at("t")] - 200) < 1e-3, "the top of the heaviest family is drawn at rangeR");
+  assert.ok(Math.abs(r[at("big")] ** 2 / r[at("mid")] ** 2 - 4) < 1e-3, "area ratio = weight ratio");
+  assert.equal(r[at("s0")], 5, "tiny values sit at the floor");
+  assert.equal(r[at("x")], Math.fround(52 * 0.4), "no known value: 0.4 × maxR");
+  // every top is ≥ TOP_RATIO × its largest member and at least its count floor
+  for (const top of ["t", "crowd"]) {
+    const q = at(top);
+    let biggest = 0; for (let i = 0; i < ns.length; i++) if (i !== q && f.top[i] === q && r[i] > biggest) biggest = r[i];
+    assert.ok(r[q] >= TOP_RATIO * biggest - 1e-4 && TOP_RATIO >= 1.5, `${top}: ${r[q]} vs largest member ${biggest}`);
+    assert.ok(r[q] >= 5 * (TOP_MIN + TOP_LOG * Math.log10(f.members[q])) - 1e-4, `${top}: count floor`);
+  }
+  // the crowded family's coins hold almost nothing: its top still stands out (≥ 3× the floor at 700)
+  assert.ok(r[at("crowd")] >= 15, `crowd top ${r[at("crowd")]}`);
+  // a heavy member forces its top up to TOP_RATIO × it even when the family sum alone is just over it
+  const pair = [node("p", null, 0, { lockedUsd: 1 }), node("q", "p", 1, { lockedUsd: 90_000 })];
+  const pf = families(pair), pw = familyWeights(pair, pf, "locked");
+  const pr = familyRadii(pf, pw, { maxW: pw[0], rangeR: 100, floor: 5, maxR: 52 });
+  assert.ok(pr[0] >= TOP_RATIO * pr[1] - 1e-4);
+});
+test("rangeFor: TOP_GROW × maxR on a big forest, never below maxR, capped on a small one", () => {
+  const big = [node("t", null, 0, { lockedUsd: 1e6 }), ...Array.from({ length: 16_000 }, (_, i) => node(`k${i}`, "t", 1, { lockedUsd: 1 }))];
+  const bf = families(big), bw = familyWeights(big, bf, "locked");
+  assert.equal(rangeFor(bf, bw, { maxW: bw[0], floor: 5, maxR: 52 }), 52 * TOP_GROW);
+  const small = [node("t", null, 0, { lockedUsd: 1e6 }), node("k", "t", 1, { lockedUsd: 1 }), node("j", "t", 1, { lockedUsd: 1 })];
+  const sf = families(small), sw = familyWeights(small, sf, "locked");
+  const rr = rangeFor(sf, sw, { maxW: sw[0], floor: 7, maxR: 52 });
+  assert.equal(rr, 52, "a three-coin map keeps today's largest radius (the fit cap would shrink it below)");
+  const mid = [node("t", null, 0, { lockedUsd: 1e6 }), ...Array.from({ length: 400 }, (_, i) => node(`m${i}`, "t", 1, { lockedUsd: 1 }))];
+  const mf = families(mid), mw = familyWeights(mid, mf, "locked");
+  const mr = rangeFor(mf, mw, { maxW: mw[0], floor: 5, maxR: 52 });
+  assert.ok(mr > 52 && mr < 52 * TOP_GROW, `a 400-coin map is capped between: ${mr}`);
 });

@@ -274,7 +274,7 @@ export default function MapPage() {
         {wide ? (
           <div className="map-panel card">
             <h1>Ecosystem map <span className="map-live"><LiveDot short /> {STATUS_LABEL[status]}</span></h1>
-            <p className="lead">Clusters are root coins and every pair under them. Area = value locked by children. Rings flash on trades; dots flow on pairs that traded in the last 30 min. Lime ring = launched on Spore.</p>
+            <p className="lead">Clusters are root coins and every pair under them. The big bubble in the middle is the root: its size is the whole family. Other bubbles are sized by the value they lock. Rings flash on trades; dots flow on pairs that traded in the last 30 min. Lime ring = launched on Spore.</p>
             <div className="map-stats">
               <div><em>roots</em><strong>{ready ? count(drawn.roots) : "—"}</strong></div>
               <div><em>coins</em><strong>{ready ? count(drawn.coins) : "—"}</strong></div>
