@@ -143,13 +143,16 @@ export function decodePool(data) {
   if (buf.length < 203 || !buf.subarray(0, 8).equals(POOL_DISCRIMINATOR)) return null;
   // discriminator 8 + bump 1 + index 2 + creator 32 + base_mint 32 + quote_mint 32 + lp_mint 32 = 139
   const key = (o) => new PublicKey(buf.subarray(o, o + 32)).toBase58();
-  let virtualQuoteReserves = "0";
+  let virtualQuoteReserves = "0", creatorFees = "0";
   if (buf.length >= 261) {
     // 203 + lp_supply 8 + coin_creator 32 + is_mayhem 1 + is_cashback 1 = 245
     const lo = buf.readBigUInt64LE(245), hi = buf.readBigInt64LE(253);
     virtualQuoteReserves = ((hi << 64n) | lo).toString();
   }
-  return { baseMint: key(43), quoteMint: key(75), baseVault: key(139), quoteVault: key(171), virtualQuoteReserves };
+  // 261 + creator_fee_bps 8 + can_edit_creator_fee 1 + is_holder_reward 1 + protocol_fees 8 = 279: the pool's
+  // unswept creator-fee bucket (pump-amm `sweep_creator_fee` moves it to the AMM creator vault; treasury).
+  if (buf.length >= 287) creatorFees = buf.readBigUInt64LE(279).toString();
+  return { baseMint: key(43), quoteMint: key(75), baseVault: key(139), quoteVault: key(171), virtualQuoteReserves, creatorFees };
 }
 
 /** SPL / Token-2022 token account: mint, owner and amount (u64 at offset 64). Null when too short. */

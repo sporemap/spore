@@ -12,6 +12,7 @@ import TradeWidget from "../components/TradeWidget";
 import CoinCard from "../components/CoinCard";
 import SplitPreview from "../components/SplitPreview";
 import FeeSplitAction from "../components/FeeSplitAction";
+import ClaimFees from "../components/ClaimFees";
 import LaunchButton, { launchBlock } from "../components/LaunchButton";
 import { Delta, Stat, StatStrip } from "../components/Stat";
 import { Addr, Chip, DepthBadge, Empty, ErrorBox, Ext, Logo, ProgressBar, Skeleton, SkeletonCard, nameOf, sym } from "../components/Bits";
@@ -193,6 +194,8 @@ export default function CoinPage() {
             <p className="muted">Your coin's curve collects {sym(coin)} instead of SOL. Every buy routes SOL → {coin.ancestors.length ? `${[...coin.ancestors].reverse().map((a) => sym(a)).join(" → ")} → ` : ""}{sym(coin)} → your coin, and {launchBlock(coin, stats?.maxDepth) ? `${launchBlock(coin, stats?.maxDepth)}.` : `your creator fees are split 50/50 with Spore, paid in ${sym(coin)}.`}</p>
             <LaunchButton coin={coin} maxDepth={stats?.maxDepth} label={`Launch a coin under ${sym(coin)}`} />
           </section>
+          {/* Pending creator fees + permissionless claim (§11.6); the card explains itself when there is no split to claim through. */}
+          <ClaimFees coin={coin} />
           {coin.shares && coin.shares.length > 0 ? (
             <section className="card pad">
               <SplitPreview title="Fee shares" shares={coin.shares} you={null} creator={coin.creator} parentCreator={null} grandparentCreator={null} platform="" />

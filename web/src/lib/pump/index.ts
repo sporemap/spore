@@ -8,3 +8,4 @@ export { LOOKUP_TABLE, lookupTables } from "./alt";
 export { sendAndConfirm, confirm, signatureState, ExpiredError, UnconfirmedError } from "./send";
 export { preflight, SimulationError, type Preflight } from "./simulate";
 export { estimateFirstBuy, type FirstBuyEstimate } from "./estimate";
+export { readClaimState, claimInstructions, buildClaimTx, parseClaimLogs, perShare, ClaimError, type ClaimState, type ClaimPayout } from "./claim";

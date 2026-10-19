@@ -1,6 +1,6 @@
 // HTTP API (DESIGN §7). Every response is JSON with every contract field present; errors are
 // `{ error }` with a 4xx/5xx status. Reads come from the in-memory model, so a request never waits
-// on the RPC except the explicitly live ones (eligibility, an unknown coin, the proxy, treasury).
+// on the RPC except the explicitly live ones (eligibility, an unknown coin, the proxy, treasury, fees).
 // Hardening (headers, CORS, rate limits, body caps, compression, caching) lives in http.mjs and is
 // wired here per route: the upload may carry a 3 MB image, everything else is capped at 16 KB.
 import express from "express";
@@ -281,6 +281,21 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
     if (!treasury) return res.json({ platform: platformWallet, ourCoins: 0, pendingByQuote: [], coins: [], updatedAt: nowS() });
     try { sendCachedJson(req, res, await treasury.get(), { maxAge: 30 }); }
     catch (e) { res.status(503).json({ error: `treasury unavailable: ${String(e.message ?? e).slice(0, 200)}` }); }
+  }));
+
+  // Pending creator fees of one coin for the coin page's "Creator fees" card (DESIGN §11.6): the fee
+  // accounts read live on the api lane and cached 15 s per mint, so the page can show the split and
+  // the browser can decide whether the permissionless claim is worth a transaction. A coin the index
+  // does not know is looked up live like /api/coin does. Nothing is signed here.
+  app.get("/api/fees/:mint", wrap(async (req, res) => {
+    const { mint } = req.params;
+    if (!isMint(mint)) return res.status(400).json({ error: "invalid mint" });
+    let c = model.get(mint);
+    if (!c) { try { c = await indexer.fetchCoin(mint, { rpc: apiRpc }); } catch (e) { log.warn(`fees ${mint}: live lookup failed: ${e.message}`); } }
+    if (!c) return res.status(404).json({ error: "unknown mint" });
+    if (!treasury) return res.status(503).json({ error: "fees unavailable" });
+    try { sendCachedJson(req, res, await treasury.fees(c, { rpc: apiRpc }), { maxAge: 5 }); }
+    catch (e) { res.status(503).json({ error: `fees unavailable: ${String(e.message ?? e).slice(0, 200)}` }); }
   }));
 
   // The Spawn page reports a signed spawn so the coin shows as ours at once. Nothing is taken on

@@ -17,19 +17,20 @@ test("isPublicIp: private, loopback, link-local, CGNAT, multicast, mapped and NA
 
 test("HostGuard: resolves once per host, refuses any non-public answer, literal IPs need no lookup", async () => {
   const lookups = [];
-  const guard = new HostGuard({ resolve: async (h) => { lookups.push(h); return h === "evil.example" ? [{ address: "93.184.216.34" }, { address: "10.0.0.5" }] : h === "nx.example" ? (() => { const e = new Error("ENOTFOUND"); e.code = "ENOTFOUND"; throw e; })() : [{ address: "93.184.216.34" }]; } });
+  const guard = new HostGuard({ resolve: async (h) => { lookups.push(h); return h === "evil.example" ? [{ address: "93.184.216.34" }, { address: "10.0.0.5" }] : h === "dual.example" ? [{ address: "2606:4700::1111" }, { address: "93.184.216.34" }] : h === "nx.example" ? (() => { const e = new Error("ENOTFOUND"); e.code = "ENOTFOUND"; throw e; })() : [{ address: "93.184.216.34" }]; } });
   assert.deepEqual(await guard.assertPublic("ipfs.io"), { address: "93.184.216.34", family: 4 }, "the vetted address is returned for pinning");
   assert.deepEqual(await guard.assertPublic("ipfs.io"), { address: "93.184.216.34", family: 4 });
   assert.deepEqual(lookups, ["ipfs.io"], "cached");
+  assert.deepEqual(await guard.assertPublic("dual.example"), { address: "93.184.216.34", family: 4 }, "IPv4 preferred over an AAAA answer for the pinned connection");
   await assert.rejects(guard.assertPublic("evil.example"), /non-public/);
   await assert.rejects(guard.assertPublic("evil.example"), /non-public/);
-  assert.equal(lookups.length, 2, "negative result cached too");
+  assert.equal(lookups.length, 3, "negative result cached too");
   await assert.rejects(guard.assertPublic("nx.example"), /cannot resolve nx.example: ENOTFOUND/);
   await assert.rejects(guard.assertPublic("127.0.0.1"), /non-public address/);
   await assert.rejects(guard.assertPublic("[::1]"), /non-public address/);
   assert.deepEqual(await guard.assertPublic("8.8.8.8"), { address: "8.8.8.8", family: 4 });
   assert.deepEqual(await guard.assertPublic("[2606:4700::1111]"), { address: "2606:4700::1111", family: 6 });
-  assert.equal(lookups.length, 3, "literals never hit DNS");
+  assert.equal(lookups.length, 4, "literals never hit DNS");
 });
 
 test("guardedFetch pins every hop to the address the guard vetted", async () => {

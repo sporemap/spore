@@ -89,14 +89,16 @@ test("Metaplex metadata: NUL-padded borsh strings", () => {
   assert.equal(decodeMetaplex(Buffer.alloc(20)), null);
 });
 
-test("pump-amm Pool: vault keys at 139/171 and the signed i128 virtual quote reserves", () => {
+test("pump-amm Pool: vault keys at 139/171, the signed i128 virtual quote reserves and the creator-fee bucket at 279", () => {
   const buf = Buffer.alloc(300);
   POOL_DISCRIMINATOR.copy(buf, 0);
   const k = (seed) => { const b = Buffer.alloc(32); b[0] = seed; return new PublicKey(b); };
   k(1).toBuffer().copy(buf, 43); k(2).toBuffer().copy(buf, 75); k(3).toBuffer().copy(buf, 139); k(4).toBuffer().copy(buf, 171);
   buf.writeBigInt64LE(-5n, 245); buf.writeBigInt64LE(-1n, 253); // i128 = -5
+  buf.writeBigUInt64LE(99_443_184n, 279); // creator_fees: the pool's unswept creator-fee bucket
   const p = decodePool(buf);
-  assert.deepEqual(p, { baseMint: k(1).toBase58(), quoteMint: k(2).toBase58(), baseVault: k(3).toBase58(), quoteVault: k(4).toBase58(), virtualQuoteReserves: "-5" });
+  assert.deepEqual(p, { baseMint: k(1).toBase58(), quoteMint: k(2).toBase58(), baseVault: k(3).toBase58(), quoteVault: k(4).toBase58(), virtualQuoteReserves: "-5", creatorFees: "99443184" });
+  assert.equal(decodePool(buf.subarray(0, 270)).creatorFees, "0", "an older, shorter Pool has no bucket");
   assert.equal(decodePool(Buffer.alloc(300)), null, "wrong discriminator");
 });
 

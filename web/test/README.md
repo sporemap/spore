@@ -6,7 +6,7 @@ wallets that can never be charged by a simulation.
 
 ```sh
 # the pump SDK's ESM build does not load under Node; the hook serves its CommonJS build instead
-node --import ./test/cjs-sdk-hook.mjs --import tsx test/simulate.mts [parentMint] [buyCoin] [splitSubject] [sellCoin] [sellHolder] [tradeThenSplitRoot] [wsolHolder] [wsolCoin]
+node --import ./test/cjs-sdk-hook.mjs --import tsx test/simulate.mts [parentMint] [buyCoin] [splitSubject] [sellCoin] [sellHolder] [tradeThenSplitRoot] [wsolHolder] [wsolCoin] [claimSolCoin] [claimTokenCoin]
 npx tsx --test test/shares.test.mts
 
 # end-to-end launch in the real page (dry mode), against a dev server on :5191 with the SHOW=all API
@@ -27,6 +27,8 @@ SHOT_DIR=/tmp/spore-e2e node --import tsx test/e2e-launch.mts both      # deskto
 | multi-hop buy, 3 hops (curve → curve → pool), 0.01 SOL | GtsYUp4G…pump (depth 2) | 905 | 20 | 196k | ok, 55.6M tokens, = SDK `simulateMultiHopSwap` |
 | multi-hop sell, 2 hops (pool → pool), 1 000 tokens | 3ZvEeeLx…pump, signer = holder 2orGyHSp… | 762 | 16 | 118k | ok, = SDK reference |
 | multi-hop sell by a holder with a funded WSOL account (7.33 SOL wrapped), 1 000 tokens, 1% slippage | BsbsB3WL…pump ($GTA, pool), signer = holder H9kuqGKN… | 629 | 12 | 67k | ok, quote 0.013412751 SOL = SDK reference, `unwrapped` = the account's lamports |
+| claim creator fees (§11.6), migrated SOL root: pump-amm pool sweep + transfer_creator_fees_to_pump_v2 + distribute_creator_fees_v2 (2026-10-19) | $SPORE HfzNFxar…wJTJY (config = platform 100%), payer = probe dBs75…TxXs (not a shareholder) | 684 | 14 | 109k | ok, event: 5.179 SOL distributed, 100% to the platform; the vault's 650 240-lamport rent floor stays behind; payer spends 17 500 lamports (fees only) |
+| claim creator fees, live child quoted in $SPORE: curve sweep + distribute_creator_fees_v2 (creates the creator's missing $SPORE ATA) | $SPCAT 75Waoewr…fGaU (creator 50 / platform 50), payer = probe | 663 | 14 | 112k | ok, event: 417 817.09 $SPORE distributed, 208 908.55 each; payer spends ~0.0015 SOL (one Token-2022 ATA + fees) |
 
 Without the lookup table the 3-hop buy is 1,245 bytes and create + fee split together cannot be
 encoded at all, which is why `buildSpawnTx` returns the split as a second transaction (`feeTx`)
@@ -101,6 +103,18 @@ Each scenario takes 3–20 s; the public RPC rate limit is the variance.
   only its compute (29k CU, no rent). `buildFeeSplitTx` reads the curve first: the sweep pays the
   creator it finds there, a complete curve gets its pool in the share update whatever the caller
   passed, and a migrated coin also gets the pool in the config and a pump-amm pool sweep.
+- Claiming (§11.6, `lib/pump/claim.ts`) is permissionless: the probe wallet, which holds no share
+  of either coin, built and simulated both payouts; the program pays the sharing config's wallets
+  whoever signs. A SOL vault keeps a rent floor the distribution leaves behind (650 240 lamports on
+  $SPORE: the API's `vault` figure includes it, the event's `distributed` does not), so the card's
+  pending total can exceed the payout by that much on a SOL coin. On a migrated coin the fees sit
+  in the pool's own `creator_fees` bucket (pool bytes 279..287) and the AMM creator vault's quote
+  ATA (wrapped SOL for a SOL pool), which `transfer_creator_fees_to_pump_v2` unwraps into the
+  pump vault; `readClaimState` sums both as `amm`. The curve sweep stays in the claim whenever the
+  curve is still live even when its bucket reads 0 (the same race as the fee split: a trade
+  between the read and the signature would make the distribution fail 6095), and is left out only
+  on a migrated curve with an empty bucket. A token-quoted distribution creates a shareholder's
+  missing ATA at the payer's cost (`shouldInitializeAta`), which `preflight`'s `spent` reports.
 - A multi-hop route whose input or output is SOL creates the user's WSOL ATA idempotently and
   closes it at the end. If that account already existed, its rent and wrapped balance pour into the
   wallet in the same transaction: measured 2026-10-18, a 1 000-token $GTA sell by a holder with

@@ -156,3 +156,31 @@
   .tape .tape-row .chip { height: 20px; padding: 0 6px; font-size: 10px; }
   .tape .tape-row .amt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
+
+/* ---------- creator fees card: pending total, each shareholder's cut, permissionless claim */
+.fees .fees-head { display: flex; align-items: center; gap: 8px; }
+.fees .fees-head .eyebrow { flex: 1; min-width: 0; }
+.fees .fees-head .linkish { font-size: 14px; line-height: 1; color: var(--faint); }
+.fees .fees-head .linkish:hover:not(:disabled) { color: var(--accent); }
+.fees .fees-head .linkish:disabled { opacity: .4; cursor: progress; }
+.fees-total { display: grid; gap: 3px; }
+.fees-total b { font-size: 24px; line-height: 1.1; letter-spacing: -0.02em; overflow-wrap: anywhere; }
+.fees-total b.accent { text-shadow: 0 0 18px rgba(182,255,92,.3); }
+.fees-total span { font-size: 12px; }
+.fees-rows { list-style: none; margin: 0 -8px; padding: 0; display: grid; gap: 2px; font-size: 13px; }
+.fees-rows li { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 8px; border: 1px solid transparent; transition: background .15s; }
+.fees-rows li .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--violet); }
+.fees-rows li .dot.platform { background: var(--faint); }
+.fees-rows li .dot.you { background: var(--accent); box-shadow: 0 0 8px rgba(182,255,92,.6); }
+/* The connected wallet's own row: it is the one number the visitor came for. */
+.fees-rows li.you { background: var(--accent-soft); border-color: var(--line-2); }
+.fees-rows li.you .split-role { color: var(--accent); font-weight: 600; }
+.fees-rows .fees-amt { display: grid; justify-items: end; gap: 0; line-height: 1.15; font-weight: 600; text-align: right; }
+.fees-rows .fees-amt small { font-size: 10px; font-weight: 400; color: var(--muted); }
+.fees-parts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.fees-parts i { font-style: normal; color: var(--faint); margin-right: 4px; }
+.fees .btn.block { width: 100%; }
+.fees .wallet-adapter-button-trigger { width: 100%; justify-content: center; }
+.fees-foot { display: flex; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 11px; }
+.fees .confirm-rows span.accent { font-weight: 600; }
+@media (max-width: 420px) { .fees-rows li { grid-template-columns: 10px minmax(0, 1fr) auto; } .fees-rows li .addr { display: none; } }

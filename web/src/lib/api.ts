@@ -50,6 +50,17 @@ export type Candle = { t: number; o: number; h: number; l: number; c: number; v:
 export type Candles = { candles: Candle[]; priceKey: "usd" | "quote" };
 /// `otherChildren`: children of this coin that exist on pump.fun but were not launched here (ours mode).
 export type CoinPage = { coin: Coin; children: Coin[]; trades: Trade[]; otherChildren?: number };
+/// `GET /api/fees/:mint` (DESIGN §11.6): the creator fees waiting for a coin, read live from the
+/// curve's bucket, the sharing config's creator vault and (migrated) the pump-amm vault, all in raw
+/// units of the coin's quote (lamports for SOL, parent-token units otherwise) as strings. `perShare`
+/// is each shareholder's cut of `total`; `claimable` is false with a `reason` when there is no
+/// sharing config, the coin pays holders instead, or nothing is distributable yet.
+export type FeeShare = { address: string; bps: number; amount: string };
+export type Fees = {
+  mint: string; quoteMint: string | null /* null = SOL */; quoteSymbol: string; quoteDecimals: number; quoteUsd: number | null;
+  shares: Shares | null; bucket: string; vault: string; amm: string; total: string; totalUsd: number | null; perShare: FeeShare[];
+  migrated: boolean; claimable: boolean; reason: string | null; updatedAt: number;
+};
 export type RootSort = "locked" | "children" | "new" | "volume";
 export type UploadBody = { name: string; symbol: string; description: string; image: string; twitter: string; telegram: string; website: string };
 
@@ -101,6 +112,8 @@ export const api = {
   /// With `limit: "all"` the depth is left to the server (its program depth cap), so every client shares one cached build.
   map: ({ limit = 60, depth, scope = "ours", since }: MapQuery = {}) => request<MapResponse>(`/map${qs({ limit, depth: depth ?? (limit === "all" ? undefined : 2), scope: scope === "all" ? "all" : undefined, since })}`, {}, 60_000),
   candles: (mint: string, res = 60) => request<Candles>(`/candles/${encodeURIComponent(mint)}${qs({ res })}`),
+  /// Pending creator fees of one coin (§11.6); the server reads the chain and caches 15 s per mint.
+  fees: (mint: string) => request<Fees>(`/fees/${encodeURIComponent(mint)}`),
   search: (q: string, signal?: AbortSignal) => request<{ coins: Coin[] }>(`/search${qs({ q })}`, { signal }),
   eligibility: (mint: string, creator?: string | null) => request<Eligibility>(`/eligibility/${encodeURIComponent(mint)}${qs({ creator })}`),
   /// The SOL pool: a root coin needs no parent, but the split and launch fee are still the server's.

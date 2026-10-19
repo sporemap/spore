@@ -115,10 +115,13 @@ export class HostGuard {
     try { addrs = await this.resolve(host); } catch (e) { throw new Error(`cannot resolve ${host}: ${e.code ?? e.message}`); }
     const list = (Array.isArray(addrs) ? addrs : [addrs]).map((a) => (typeof a === "string" ? a : a?.address)).filter(Boolean);
     const ok = list.length > 0 && list.every(isPublicIp);
-    this.cache.set(host, { at: this.now(), ok, address: ok ? list[0] : null });
+    // IPv4 first: the pinned connection gets exactly one address, and a host without an IPv6 route
+    // cannot fall back from an unreachable AAAA answer the way an unpinned connect would.
+    const pick = ok ? list.find((a) => familyOf(a) === 4) ?? list[0] : null;
+    this.cache.set(host, { at: this.now(), ok, address: pick });
     if (this.cache.size > 2_000) for (const [k, v] of this.cache) if (this.now() - v.at >= this.ttlMs) this.cache.delete(k);
     if (!ok) throw new Error(`refusing ${host}: resolves to a non-public address`);
-    return { address: list[0], family: familyOf(list[0]) };
+    return { address: pick, family: familyOf(pick) };
   }
 }
 
@@ -146,7 +149,10 @@ export function pinnedFetch(url, init = {}, { address = null, family = 0 } = {})
       host: u.hostname, servername: u.hostname, port: u.port || 443, path: `${u.pathname}${u.search}`,
       method: init.method ?? "GET", headers: headerList(init.headers),
       // net may ask for every address (autoSelectFamily) or just one: answer the pinned one either way.
-      lookup: address ? (host, opts, cb) => { const fam = family || familyOf(address); if (opts?.all) cb(null, [{ address, family: fam }]); else cb(null, address, fam); } : undefined,
+      // Answered on the next tick like dns.lookup does: net assumes an asynchronous lookup, and a
+      // connect error raised inside a synchronous callback escapes the request's error handler
+      // (an unreachable pinned address took the whole process down that way).
+      lookup: address ? (host, opts, cb) => { const fam = family || familyOf(address); process.nextTick(() => (opts?.all ? cb(null, [{ address, family: fam }]) : cb(null, address, fam))); } : undefined,
     }, (res) => {
       const status = res.statusCode ?? 0;
       if (status < 200 || status > 599) { res.resume(); return reject(new Error(`unexpected status ${status}`)); }

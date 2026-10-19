@@ -4,7 +4,7 @@ import { ComputeBudgetProgram, Connection, PublicKey, TransactionMessage, type V
 import { NATIVE_MINT, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import BN from "bn.js";
 import { OnlinePumpSdk, PUMP_PROGRAM_ID, PUMP_SDK, isBondingCurveMigrated, normalizeQuoteMint, isLegacyQuoteMint } from "@pump-fun/pump-sdk";
-import { buildSpawnTx, buildFeeSplitTx, buildSwapTx, compileV0, lookupTables, quoteSwap, splitShares, hopsFor, type Chain } from "../src/lib/pump/index.ts";
+import { buildSpawnTx, buildFeeSplitTx, buildSwapTx, buildClaimTx, compileV0, lookupTables, parseClaimLogs, perShare, quoteSwap, readClaimState, splitShares, hopsFor, type Chain } from "../src/lib/pump/index.ts";
 
 const RPC = process.env.RPC_URL ?? "https://api.mainnet-beta.solana.com";
 const PROBE = new PublicKey("dBs75Gf7RXQMAsMLuTLYdH2fHV1ac9zgCEh6zC7TxXs"); // a funded public wallet; only its pubkey is used
@@ -16,7 +16,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /// Runs the transaction on the node and reports; `code` is pump's custom error when it failed with
 /// one, so a case can assert a specific refusal.
-async function simulate(label: string, tx: VersionedTransaction, expectCode?: number): Promise<{ ok: boolean; code: number | null }> {
+async function simulate(label: string, tx: VersionedTransaction, expectCode?: number): Promise<{ ok: boolean; code: number | null; logs: string[]; units: number; bytes: number }> {
   const sim = await conn.simulateTransaction(tx, { sigVerify: false, replaceRecentBlockhash: true, commitment: "confirmed" });
   const logs = sim.value.logs ?? [];
   const bytes = tx.serialize().length;
@@ -25,7 +25,7 @@ async function simulate(label: string, tx: VersionedTransaction, expectCode?: nu
   const expected = expectCode !== undefined && code === expectCode;
   console.log(`\n[${label}] bytes=${bytes} accounts=${tx.message.staticAccountKeys.length} units=${sim.value.unitsConsumed} err=${sim.value.err ? JSON.stringify(sim.value.err) : "none"} ${custom?.[0] ?? ""}${expected ? " (expected)" : ""}`);
   if (sim.value.err && !expected) console.log(logs.slice(-12).join("\n"));
-  return { ok: !sim.value.err, code };
+  return { ok: !sim.value.err, code, logs, units: sim.value.unitsConsumed ?? 0, bytes };
 }
 
 /// The Chain the UI would hand the library, derived from live accounts via the SDK.
@@ -188,6 +188,38 @@ try {
   if (sq.unwrapped !== BigInt(wsol?.lamports ?? 0)) { ok = false; console.log("unwrapped lamports MISMATCH with the WSOL account"); }
   ok = (await simulate("multi-hop sell from a WSOL holder, 1% slippage", await buildSwapTx(conn, WSOL_HOLDER, chain, "sell", amount, (sq.amountOut * 99n) / 100n))).ok && ok;
 } catch (e) { ok = false; console.log("WSOL-holder sell FAILED:", (e as Error).message); }
+
+// 4. Claim creator fees (DESIGN §11.6): the permissionless payout, built for ANY payer (the probe,
+// which holds no share) on two live Spore coins. $SPORE is a migrated SOL-quoted root whose config
+// pays the platform 100% (pool sweep + AMM → vault transfer + distribute); $SPCAT is a live child
+// quoted in $SPORE with a creator/platform 50/50 split (curve sweep + distribute; the program
+// creates a shareholder's missing $SPORE token account at the payer's cost). Each must pass, run
+// distribute_creator_fees_v2 and report the payouts in its DistributeCreatorFeesEvent.
+for (const [label, mintStr] of [["$SPORE root, SOL, migrated", process.argv[10] ?? "HfzNFxar7oggDCHnK2ekkygDsLNuCGh3dXdRQS3wJTJY"], ["$SPCAT child quoted in $SPORE, live curve", process.argv[11] ?? "75WaoewrcoaDtT5HpQnovQS1wNL3Y21LvX45iQkLfGaU"]] as const) {
+  try {
+    const mint = new PublicKey(mintStr);
+    const s = await readClaimState(conn, mint);
+    const unit = s.sol ? "lamports" : "quote units";
+    console.log(`\nclaim subject ${mintStr.slice(0, 8)}… ${s.migrated ? "pool" : "curve"} ${s.sol ? "SOL" : `quote ${s.quoteMint.toBase58().slice(0, 8)}…`} | bucket ${s.bucket} · vault ${s.vault} · amm ${s.amm} = ${s.total} ${unit} | shares ${s.config ? s.config.shareholders.map((x) => `${x.address.toBase58().slice(0, 6)}…:${x.shareBps}`).join(" ") : "none"}`);
+    if (!s.config) throw new Error("no sharing config: pick a Spore launch");
+    const tx = await buildClaimTx(conn, PROBE, mint, s);
+    const r = await simulate(`claim ${label} (payer: probe)`, tx);
+    ok = r.ok && ok;
+    if (!r.logs.some((l) => /Instruction: DistributeCreatorFeesV2/.test(l))) { ok = false; console.log("distribute_creator_fees_v2 did not run"); }
+    const payout = parseClaimLogs(r.logs);
+    if (!payout) { ok = false; console.log("no DistributeCreatorFeesEvent in the logs"); }
+    else {
+      console.log(`distributed ${payout.distributed} ${unit} → ${payout.shares.map((x) => `${x.address.toBase58().slice(0, 6)}… ${x.amount} (${x.bps / 100}%)`).join(" · ")}`);
+      const cfg = s.config.shareholders;
+      if (payout.shares.length !== cfg.length || payout.shares.some((x, i) => !x.address.equals(cfg[i].address) || x.bps !== cfg[i].shareBps)) { ok = false; console.log("the event's shareholders differ from the sharing config"); }
+      if (payout.distributed > s.total) { ok = false; console.log("distributed more than the pending total"); }
+      // The builder's preview (perShare over the pending total) must agree with the program's
+      // payout up to the SOL vault's rent floor, which stays behind.
+      const preview = perShare(s.config, s.total);
+      if (preview.some((p, i) => p.amount < payout.shares[i].amount)) { ok = false; console.log("preview pays less than the program did"); }
+    }
+  } catch (e) { ok = false; console.log("claim FAILED:", (e as Error).message); }
+}
 
 console.log(ok ? "\nALL SIMULATIONS OK" : "\nSOME SIMULATIONS FAILED");
 process.exit(ok ? 0 : 1);
