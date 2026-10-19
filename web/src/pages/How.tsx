@@ -152,7 +152,7 @@ export default function How() {
           </Card>
         </div>
 
-        <div className="how-foot"><Link to="/launch" className="btn lg accent">Launch a coin</Link><Link to="/explore" className="btn lg ghost">Explore launches</Link><p className="hint">Every fee and rule, in full: <Link to="/fees">Fees &amp; rules</Link>.</p></div>
+        <div className="how-foot"><Link to="/launch" className="btn lg accent">Launch a coin</Link><Link to="/explore" className="btn lg ghost">Explore launches</Link><p className="hint">Every fee and rule, in full: <Link to="/fees">Fees &amp; rules</Link>. Building a terminal or a coin page? The family-tree data and widgets are open: <Link to="/docs/api">API &amp; embeds</Link>.</p></div>
       </div>
     </>
   );

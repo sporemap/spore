@@ -75,7 +75,17 @@ export function loadConfig(env = process.env, { here = process.cwd() } = {}) {
   const metaGcHours = num("META_GC_HOURS", 24, { min: 0 }); // 0 = never delete uploaded files
   const imgCacheBytes = num("IMG_CACHE_MB", 512, { min: 1 }) * 1024 * 1024;
   const distDir = get("DIST_DIR", join(here, "../web/dist"));
+  // Partner API (DESIGN §12): absolute links and image URLs are built on PUBLIC_URL; tiers per minute.
+  const publicUrl = url("PUBLIC_URL", "https://sporepad.com", ["http:", "https:"]).replace(/\/+$/, "");
+  try { if (new URL(publicUrl).origin !== publicUrl) errors.push(`PUBLIC_URL=${JSON.stringify(publicUrl)} must be an origin (scheme://host[:port], no path)`); } catch { /* reported by url() */ }
+  const v1Limits = {
+    publicPerMin: num("V1_RATE_PUBLIC", 60, { min: 1, integer: true }),
+    partnerPerMin: num("V1_RATE_PARTNER", 1200, { min: 1, integer: true }),
+    publicStreams: num("V1_STREAMS_PUBLIC", 2, { min: 1, integer: true }),
+    partnerStreams: num("V1_STREAMS_PARTNER", 20, { min: 1, integer: true }),
+    maxStreams: num("V1_STREAMS_MAX", 2_000, { min: 1, integer: true }),
+  };
 
   if (errors.length) throw new Error(`invalid configuration:\n  - ${errors.join("\n  - ")}\nSee deploy/env.example for every variable.`);
-  return { port, rpcUrl, wsUrl, dataDir, platformWallet, splitBps, platformMinBps, launchFeeSol, refreshMs, fullRefreshMs, backfill, backfillLimit, concurrency, rpcRps, rpcApiRps, rpcProxyRps, createdAtProbe, origins, show, pagesDomain, pagesProject, metaDir, trustProxy, hsts, logSample, rates, cspConnect, treasuryTtlMs, sseMaxClients, ssePerIp, uploadQuota, metaGcHours, imgCacheBytes, distDir };
+  return { port, rpcUrl, wsUrl, dataDir, platformWallet, splitBps, platformMinBps, launchFeeSol, refreshMs, fullRefreshMs, backfill, backfillLimit, concurrency, rpcRps, rpcApiRps, rpcProxyRps, createdAtProbe, origins, show, pagesDomain, pagesProject, metaDir, trustProxy, hsts, logSample, rates, cspConnect, treasuryTtlMs, sseMaxClients, ssePerIp, uploadQuota, metaGcHours, imgCacheBytes, distDir, publicUrl, v1Limits };
 }

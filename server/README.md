@@ -51,6 +51,9 @@ npm run fixtures                # re-capture test/fixtures from mainnet (read-on
 | `CSP_CONNECT` | empty | Extra `connect-src` hosts for the SPA's Content-Security-Policy (normally none: the browser reaches the chain only through `/api/rpc`). |
 | `TREASURY_TTL_MS` | `60000` | Cache of `GET /api/treasury`. |
 | `DIST_DIR` | `../web/dist` | Built web app served with the SPA fallback. |
+| `PUBLIC_URL` | `https://sporepad.com` | Origin the partner API (`/v1`) builds absolute links and image URLs on. |
+| `V1_RATE_PUBLIC` / `V1_RATE_PARTNER` | `60` / `1200` | `/v1` requests per minute: per client IP without a key, per key with one. |
+| `V1_STREAMS_PUBLIC` / `V1_STREAMS_PARTNER` / `V1_STREAMS_MAX` | `2` / `20` / `2000` | Concurrent `/v1/stream` connections per IP, per key, and in total. |
 
 Every variable is validated at boot by `lib/config.mjs`; a bad value stops the process with every
 problem listed (`spore: invalid configuration: - PORT=… must be …`). `deploy/env.example` documents
@@ -242,7 +245,7 @@ first (see the security notes in the fix report).
 `node:sqlite`, WAL mode: `coins`, `mints`, `trades` (≤ 2 000 per mint, 24 h volume and candles),
 `meta` (off-chain JSON cache with `attempts`; weekly re-read of a resolved image, backoff retries from
 15 min to 24 h, IPFS gateway rotation), `backfill_curves`, `backfill_state`, `kv` (SOL price,
-decoded `Global`, schema version). `coins.updated_at` is milliseconds (v3). Migrations are idempotent
+decoded `Global`, schema version), `api_keys` (partner keys as sha256, usage counters). `coins.updated_at` is milliseconds (v3). Migrations are idempotent
 (`CREATE IF NOT EXISTS` plus versioned column additions; v3 also rescales `updated_at` once).
 
 ## API
@@ -270,9 +273,48 @@ DESIGN §7, plus a few extras that never replace a contract field:
 - `GET /api/claims?limit=50` → `{ coins, totals, updatedAt }`: the Spore launches with creator fees waiting, biggest first; cached 30 s. Both read fee accounts in batches through the per-mint cache `/api/fees` uses.
 - `GET /api/health` → `{ ok, status, uptimeS, indexer: { phase, lagS, backfill }, ws: { connected, lastMessageAgoMs, backoffMs }, rpc, rpcLanes, meta, images, metahost (+ quota), treasury, sse, sseStats, memoryMb }`; `?strict=1` answers 503 when degraded (socket down > 2 min or no refresh for 5 min)
 
+## Partner API (/v1, DESIGN §12)
+
+Read-only data for other trading terminals, versioned under `/v1` (`lib/v1.mjs`, OpenAPI in
+`lib/openapi.mjs`, keys in `lib/apikeys.mjs`). Only GET routes exist; any other method is 405.
+
+- `GET /v1/coin/:mint/family` → `{ mint, name, symbol, image, depth, quoteMint, quoteSymbol, root, parent, ancestors, children: { count, top }, descendants, lockedUsd, mcapUsd, change24h, trades1h, launchedOnSpore, links }`: any pump.fun mint (live lookup on the api RPC lane when not indexed; 404 when it is not a pump coin, 503 when the lookup fails); `top` = up to 20 children by locked value; `change24h` in percent against the last trade at or before 24 h ago (null without trades); cached 5 s per mint.
+- `GET /v1/tree/:mint` → `{ root, nodes: [{ ...MapCoin, parentMint }], total }`: the whole tree containing the mint, root first, breadth-first, siblings by locked value; cached 10 s per root.
+- `GET /v1/map[?since=<ms>]` and `GET /v1/heat`: the `/api/map?scope=all&limit=all` and `/api/map/heat` bodies from the same caches (the map bytes rewritten once per build so images are absolute; `since` rounded down to the second).
+- `GET /v1/stream?types=pair,trade,heat,stats[,mapdelta,coin][&mint=<coin>]`: the hub's events (the hub has a `subscribe` hook for in-process listeners), filtered by type and by the tree of `mint` (root resolved per event), `heat` rows derived per trade, absolute images, `retry: 3000`, heartbeat every 25 s, backpressure cut at 256 KB.
+- `GET /v1/openapi.json`: the OpenAPI 3.1 document (tests check that every route is listed and every `$ref` resolves).
+
+Every image is absolute on `PUBLIC_URL`. CORS is `*` (GET/OPTIONS, `X-API-Key`, no credentials; preflights
+answered before auth); `/api` keeps its allowlist. Family/tree/map/heat send `public, max-age=5, s-maxage=10`
++ ETag/304 so a CDN absorbs polling; the stream and errors are `no-store`.
+
+**Tiers.** No key = public: `V1_RATE_PUBLIC` requests/min per client IP, `V1_STREAMS_PUBLIC` streams per IP.
+`X-API-Key: spk_<32 base58>` = partner: `V1_RATE_PARTNER`/min and `V1_STREAMS_PARTNER` streams per key
+(`?key=` only on `/v1/stream`, a 400 elsewhere). Invalid or revoked key → 401 (charged to the IP's public
+budget). Headers: `X-Spore-Tier`, `X-RateLimit-Limit/Remaining/Reset/Policy`; 429 carries `Retry-After`.
+Keys are stored as sha256 only (`api_keys`); a verified key is cached 15 s, so a revocation lands within 15 s;
+`requests` / `last_used_at` are written in one transaction every 30 s and at shutdown. `/api/health.v1`
+reports open streams and key counters.
+
+**Keys (CLI only, no HTTP admin):**
+
+```
+node --disable-warning=ExperimentalWarning scripts/keys.mjs create --name "Axiom" --contact "@axiom"   # prints the key once
+node --disable-warning=ExperimentalWarning scripts/keys.mjs list                                        # id, name, contact, tier, created, status
+node --disable-warning=ExperimentalWarning scripts/keys.mjs revoke 3                                    # refused by the server within 15 s
+node --disable-warning=ExperimentalWarning scripts/keys.mjs usage                                       # requests and last use (≤ 30 s behind)
+```
+
+It opens `DATA_DIR/spore.sqlite` (`--data <dir>` overrides) next to the running server and refuses a missing
+file. The server's connection waits up to 2 s for a write lock (`busy_timeout`) so the CLI never makes a
+server write fail.
+
+**Embeds.** `/embed` and `/embed/*` serve index.html with `frame-ancestors *` and no `X-Frame-Options`
+(`isEmbedPath` in lib/http.mjs); every other path keeps `frame-ancestors 'none'` + `X-Frame-Options: DENY`.
+
 ## Hardening (lib/http.mjs, lib/validate.mjs, lib/net.mjs)
 
-- Headers on every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`, a closed CSP for JSON (`default-src 'none'; frame-ancestors 'none'`), HSTS when the request came over TLS. `index.html` gets the SPA CSP (`default-src 'self'`, connect/img to self + `PAGES_DOMAIN`, Google Fonts, Solflare's iframe, `frame-ancestors 'none'`) with a per-request nonce substituted into `__CSP_NONCE__` so one inline theme snippet may exist; nothing else inline.
+- Headers on every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` (not on the `/embed/*` pages), `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`, a closed CSP for JSON (`default-src 'none'; frame-ancestors 'none'`), HSTS when the request came over TLS. `index.html` gets the SPA CSP (`default-src 'self'`, connect/img to self + `PAGES_DOMAIN`, Google Fonts, Solflare's iframe and same-origin frames (`frame-src 'self'`, so /docs/api can preview the `/embed/*` widgets), `frame-ancestors 'none'`) with a per-request nonce substituted into `__CSP_NONCE__` so one inline theme snippet may exist; nothing else inline.
 - Bodies: 16 KB JSON everywhere, 3 MB on `/api/upload` → `413 { error }`.
 - Rate limits per IP with `X-RateLimit-Limit/Remaining/Reset/Policy`, `429 { error, retryAfter }` + `Retry-After`. An upload rejected by validation (or by a daily quota) refunds its attempt.
 - SSE: new `/api/events` connections are rate-limited per IP, capped per IP and in total (`SSE_*`), and a client that stops reading is destroyed once 256 KB are buffered for it instead of growing the heap.
@@ -289,7 +331,7 @@ Extra fields on `Coin`: `quoteDecimals` (to format `lockedQuote`), `curve`, `may
 `totalSupply` and `lockedQuote` are raw on-chain integers as strings; use `decimals` / `quoteDecimals`.
 `root` and `parent` are `null` on a depth-0 coin.
 
-In production the server also serves `../web/dist` with an SPA fallback for every non-`/api` path.
+In production the server also serves `../web/dist` with an SPA fallback for every path outside `/api` and `/v1`.
 
 ## Layout
 
@@ -314,7 +356,11 @@ lib/indexer.mjs     backfill, live handlers, refresh loop
 lib/eligibility.mjs create_v2 admission check via the SDK
 lib/events.mjs      SSE hub with per-IP / global caps and backpressure
 lib/api.mjs         express routes
+lib/v1.mjs          partner API: tiers, family/tree/map/heat, filtered stream (DESIGN §12)
+lib/openapi.mjs     OpenAPI 3.1 document of /v1
+lib/apikeys.mjs     partner keys: generation, sha256 storage, verify cache, batched usage counters
 scripts/capture-fixtures.mjs   captures real events/accounts into test/fixtures
 scripts/backup.mjs             online sqlite backup (backup API, integrity check, retention)
-test/*.test.mjs     decoders (real bytes), pricing, split, launch fee, allowlists, db, model, ours mode (model + API, bps floor), spawn verification (real create tx, fixtures/tx-create.json), indexer adopt + lookup cache, metadata host (deploy lock, quotas, gc), API contract (incl. proxy rules), hardening (headers, CSP, 413, 429, compression, ETag, health, treasury, upload validation), per-coin fees (shape, split, migrated SOL vaults, cache, 304, 404, no config / nothing / holder-reward), SSE caps, validation, SSRF guards (v6 forms, pinning), config, RPC lanes, live reconnect, treasury, network smoke
+scripts/keys.mjs               partner API keys: create (printed once) / list / revoke / usage
+test/*.test.mjs     decoders (real bytes), pricing, split, launch fee, allowlists, db, model, ours mode (model + API, bps floor), spawn verification (real create tx, fixtures/tx-create.json), indexer adopt + lookup cache, metadata host (deploy lock, quotas, gc), API contract (incl. proxy rules), hardening (headers, CSP, 413, 429, compression, ETag, health, treasury, upload validation), per-coin fees (shape, split, migrated SOL vaults, cache, 304, 404, no config / nothing / holder-reward), SSE caps, validation, SSRF guards (v6 forms, pinning), config, RPC lanes, live reconnect, treasury, partner API (shapes, 404s, live lookup, cache headers, CORS, read-only, tiers, stream filters, embed framing, OpenAPI refs), API keys (format, hash-only storage, revocation, batched usage, CLI), network smoke
 ```

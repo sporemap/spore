@@ -64,7 +64,7 @@ test("SPA: index.html carries the full CSP with a fresh nonce substituted into t
   assert.ok(nonce, csp);
   assert.ok(html.includes(`<script nonce="${nonce}">`), "nonce substituted");
   assert.ok(!html.includes("__CSP_NONCE__"));
-  for (const d of ["default-src 'self'", "frame-ancestors 'none'", "object-src 'none'", "connect-src 'self' https://spore-2x6.pages.dev", "img-src 'self' data: blob: https://spore-2x6.pages.dev", "https://fonts.gstatic.com", "frame-src https://connect.solflare.com", "base-uri 'self'"]) assert.ok(csp.includes(d), d);
+  for (const d of ["default-src 'self'", "frame-ancestors 'none'", "object-src 'none'", "connect-src 'self' https://spore-2x6.pages.dev", "img-src 'self' data: blob: https://spore-2x6.pages.dev", "https://fonts.gstatic.com", "frame-src 'self' https://connect.solflare.com", "base-uri 'self'"]) assert.ok(csp.includes(d), d);
   assert.equal(r.headers.get("cache-control"), "no-cache");
   const r2 = await get("/explore");
   assert.notEqual(r2.headers.get("content-security-policy").match(/'nonce-([^']+)'/)[1], nonce, "nonce is per request");

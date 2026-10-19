@@ -14,6 +14,7 @@ import { Indexer } from "./lib/indexer.mjs";
 import { createApp } from "./lib/api.mjs";
 import { MetaHost, DailyQuota } from "./lib/metahost.mjs";
 import { Treasury } from "./lib/treasury.mjs";
+import { ApiKeys } from "./lib/apikeys.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const log = {
@@ -36,10 +37,13 @@ const hub = new EventHub({ maxClients: cfg.sseMaxClients, maxPerIp: cfg.ssePerIp
 const images = new ImageCache(join(cfg.dataDir, "img"), { log, maxBytes: cfg.imgCacheBytes });
 const meta = new MetaFetcher(model, { log, concurrency: 6 });
 const indexer = new Indexer({ rpc, model, meta, hub, log, opts: { backfill: cfg.backfill, backfillLimit: cfg.backfillLimit, refreshMs: cfg.refreshMs, fullRefreshMs: cfg.fullRefreshMs, wsUrl: cfg.wsUrl, createdAtProbe: cfg.createdAtProbe } });
+// Partner keys for /v1 (DESIGN §12): verified per request, usage counters written every 30 s.
+const apiKeys = new ApiKeys(db, { log }).start();
 const treasury = new Treasury({ model, rpc, platformWallet: cfg.platformWallet, ttlMs: cfg.treasuryTtlMs, log });
 const app = createApp({
   model, indexer, rpc, hub, images, meta, metahost, treasury, metaDir: cfg.metaDir, platformWallet: cfg.platformWallet, splitBps: cfg.splitBps, launchFeeSol: cfg.launchFeeSol,
   distDir: cfg.distDir, origins: cfg.origins, log, rates: cfg.rates, trustProxy: cfg.trustProxy, hsts: cfg.hsts, logSample: cfg.logSample, pagesDomain: cfg.pagesDomain, cspConnect: cfg.cspConnect,
+  apiKeys, publicUrl: cfg.publicUrl, v1Limits: cfg.v1Limits,
 });
 
 const server = app.listen(cfg.port, () => log.info(`spore api on :${cfg.port} → ${redact(cfg.rpcUrl)} (ws ${redact(cfg.wsUrl)}) data ${cfg.dataDir}${cfg.backfill ? (Number.isFinite(cfg.backfillLimit) ? ` backfill limit ${cfg.backfillLimit}` : "") : " backfill off"} mode ${cfg.show} fee ${cfg.launchFeeSol} SOL meta ${cfg.pagesDomain} trust-proxy ${JSON.stringify(cfg.trustProxy)}`));
@@ -72,11 +76,11 @@ function shutdown(signal) {
   stopping = true;
   log.info(`shutting down (${signal})`);
   clearInterval(imageSweep); clearInterval(checkpoint); if (metaGc) clearInterval(metaGc);
-  indexer.stop(); meta.stop(); hub.close();
-  server.close(() => { try { db.close(); } catch { /* already closed */ } log.info("bye"); process.exit(process.exitCode ?? 0); });
+  indexer.stop(); meta.stop(); hub.close(); app.locals.v1?.close(); apiKeys.stop();
+  server.close(() => { try { apiKeys.flush(); db.close(); } catch { /* already closed */ } log.info("bye"); process.exit(process.exitCode ?? 0); });
   server.closeIdleConnections?.();
   setTimeout(() => server.closeAllConnections?.(), 2_000).unref();
-  setTimeout(() => { log.warn("forced exit"); try { db.close(); } catch { /* ignore */ } process.exit(process.exitCode ?? 0); }, 8_000).unref();
+  setTimeout(() => { log.warn("forced exit"); try { apiKeys.flush(); db.close(); } catch { /* ignore */ } process.exit(process.exitCode ?? 0); }, 8_000).unref();
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

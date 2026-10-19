@@ -10,6 +10,7 @@ export class EventHub {
     this.perIp = new Map();
     this.maxClients = maxClients; this.maxPerIp = maxPerIp; this.maxBuffered = maxBuffered;
     this.stats = { refused: 0, dropped: 0 };
+    this.listeners = new Set(); // in-process consumers of every event (the /v1 stream, DESIGN §12)
     this.timer = setInterval(() => this.#heartbeat(), heartbeatMs);
     this.timer.unref();
   }
@@ -37,10 +38,14 @@ export class EventHub {
   }
 
   emit(event, data) {
+    for (const fn of this.listeners) { try { fn(event, data); } catch { /* a listener never breaks the stream */ } }
     if (!this.clients.size) return;
     const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of this.clients) this.#write(res, frame);
   }
+
+  /** Calls `fn(event, data)` for every event emitted from now on; returns the unsubscribe function. */
+  subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
 
   #heartbeat() { for (const res of this.clients) this.#write(res, `: hb ${Date.now()}\n\n`); }
   #write(res, frame) {
@@ -58,5 +63,5 @@ export class EventHub {
   }
   #drop(res) { this.#forget(res); try { res.destroy(); } catch { /* already gone */ } }
 
-  close() { clearInterval(this.timer); for (const res of this.clients) { try { res.end(); } catch { /* closing */ } } this.clients.clear(); this.perIp.clear(); }
+  close() { this.listeners.clear(); clearInterval(this.timer); for (const res of this.clients) { try { res.end(); } catch { /* closing */ } } this.clients.clear(); this.perIp.clear(); }
 }

@@ -250,3 +250,55 @@ pump.fun's `/api/ipfs` is retired (500 as of 2026-10-18). Metadata is self-hoste
 **Web contract**
 - `web/src/lib/pump/claim.ts`: `buildClaimTx(conn, payer, mint) → VersionedTransaction` (sweep the curve bucket when > 0, sweep the pool vault when migrated, `distribute_creator_fees_v2`), compiled v0 with the Spore lookup table (`alt.ts`), ≤ 1 232 bytes, for **any** connected wallet as payer; `simulate.ts` preflight before the wallet signs, `send.ts` to send.
 - Coin page card **"Creator fees"**: pending total in quote + USD, the split rows with each shareholder's amount (the connected wallet's row marked "you"), a **Claim** button → preflight simulation (shows the network fee) → wallet → toast with the Solscan link → refetch. Disabled states with one reason each: no wallet, nothing to claim (below the program's minimum), no sharing config (then the existing fee-split action is shown instead), holder-reward coin. A small "fees to claim" chip on coin cards and feed rows when `total > 0` is optional.
+
+## 12. Partner API & embeds (owner 2026-10-19)
+
+Spore's map data is offered to other trading terminals (Axiom, GMGN, Photon, BullX, …) as a product: (1) embeddable widgets a terminal drops into a coin page with one iframe, (2) a versioned, documented, read-only API with keys for partners, (3) a public docs page. **Everything is read-only: no endpoint may sign, send or accept a transaction.**
+
+### 12.1 API contract (`/v1`, same server: `https://sporepad.com/v1/...`)
+
+JSON, camelCase; amounts as strings in raw units plus decimals; USD as numbers or null; timestamps unix seconds (`generatedAt`/`since` and `mapdelta.at` are milliseconds, as in §11.5). Every image URL is absolute (`https://sporepad.com/api/img?u=…`, built on `PUBLIC_URL`), since a partner page lives on another origin.
+
+```ts
+type CoinRef = { mint: string; name: string | null; symbol: string | null; image: string | null; depth: number };
+type MapCoin = CoinRef & { ours: boolean; oursPending: boolean; mcapUsd: number | null; lockedUsd: number | null; children: number; descendants: number; otherChildren: number; migrated: boolean; createdAt: number | null };
+
+GET /v1/coin/:mint/family → { mint, name, symbol, image, depth, quoteMint /* null = SOL */, quoteSymbol,
+      root: CoinRef /* itself for a root */, parent: CoinRef | null, ancestors: CoinRef[] /* nearest first */,
+      children: { count, top: (CoinRef & { mcapUsd, lockedUsd })[] /* ≤ 20, most locked value first */ },
+      descendants, lockedUsd, mcapUsd, change24h: number | null /* percent */, trades1h, launchedOnSpore: boolean,
+      links: { spore: "https://sporepad.com/c/<mint>", launchUnder: "https://sporepad.com/launch?parent=<mint>", embed: "https://sporepad.com/embed/tree/<mint>" } }
+    Any pump.fun mint (looked up live like /api/coin when not indexed); 400 malformed; 404 for a mint that is not a pump coin; 503 + retryAfter when the live lookup fails.
+GET /v1/tree/:mint → { root: CoinRef, nodes: (MapCoin & { parentMint: string | null })[], total }
+    The whole tree containing the mint, from its root: root first, then breadth-first, siblings by locked value. A coin the index does not track is appended with its chain.
+GET /v1/map?since=<ms> → /api/map?scope=all&limit=all (full: { roots, scope, version, generatedAt, total }; delta: { nodes, removed, generatedAt, total, version }). `since` is rounded down to the second.
+GET /v1/heat → /api/map/heat (Heat, §7)
+GET /v1/stream?types=pair,trade,heat,stats[&mint=<root or any coin of the tree>] → SSE
+GET /v1/openapi.json → OpenAPI 3.1 of every /v1 route, schemas and examples
+```
+
+- **Numbers** are the whole-ecosystem ones (the map's `scope=all`), whatever `SHOW` is: `lockedUsd`/`descendants`/`children` count every pump.fun child. `launchedOnSpore` = ours or verified-pending (§11.1). `change24h` = current price against the last trade at or before 24 h ago (or the first trade inside the window when the history starts there), in USD when both prices have one, else in quote units; null without recorded trades. `trades1h` from the activity counters (§11.5).
+- **Stream** types: `pair`, `trade`, `heat`, `stats` (default set) plus `mapdelta` and `coin` on request; unknown types → 400. `heat` is derived per trade: `{ mint, at, t1h, n24, v24, last, buys1h }`, the coin's /v1/heat row. `mint=` keeps the events of the tree containing that coin (its root resolved per event, so coins joining later are followed); `mapdelta` is narrowed to the tree's entries; `stats` is never narrowed. Images in `pair`/`mapdelta`/`coin` payloads are absolute. `retry: 3000`, heartbeat comment every 25 s, `Cache-Control: no-store`; a client whose socket stops draining is cut at 256 KB buffered.
+- **Read-only**: the router registers GET routes only; any other method is 405 (`Allow: GET, HEAD, OPTIONS`); unknown /v1 paths are 404 JSON pointing at the docs.
+
+### 12.2 Keys and tiers
+
+- Key: `spk_` + 32 base58 characters (rejection-sampled, ~187 bits), sent in `X-API-Key`; `?key=` is accepted on `/v1/stream` only (EventSource cannot set headers; a key in any other URL is a 400, URLs end up in logs and caches).
+- Stored hashed: sqlite `api_keys (id, name, contact, hash /* sha256 hex, unique */, tier 'partner', created_at, revoked_at, last_used_at, requests)`. The plaintext is printed once by the CLI and never logged, stored or echoed.
+- Tiers: **public** (no key) 60 requests/min per client IP on /v1, 2 concurrent streams per IP; **partner** (valid key) 1 200 requests/min per key, 20 concurrent streams per key; an invalid or revoked key → `401 { error }` (and the attempt is charged to the caller's public IP budget). Every response carries `X-Spore-Tier` and `X-RateLimit-Limit/Remaining/Reset/Policy`; `429 { error, retryAfter, tier }` with `Retry-After`. Env: `V1_RATE_PUBLIC`, `V1_RATE_PARTNER`, `V1_STREAMS_PUBLIC`, `V1_STREAMS_PARTNER`, `V1_STREAMS_MAX` (2 000 total), `PUBLIC_URL`.
+- Verification: a sha256 lookup (indexed) per keyed request, hits cached 15 s (a revocation from the CLI takes effect within 15 s; misses are not cached, so a new key works at once). Usage (`requests`, `last_used_at`) is counted in memory and written in one transaction every 30 s and at shutdown, never per request.
+- Admin is a CLI only (no HTTP admin endpoint): `node server/scripts/keys.mjs create --name <partner> [--contact <x>] | list | revoke <id> | usage` on `DATA_DIR/spore.sqlite` (`--data` overrides; refuses a missing file). The server's sqlite connection waits up to 2 s for a lock (`busy_timeout`) so a CLI write never fails a server write.
+
+### 12.3 HTTP behaviour
+
+- CORS on /v1/*: `Access-Control-Allow-Origin: *`, methods `GET, OPTIONS`, headers `X-API-Key, Content-Type`, no credentials, `Access-Control-Expose-Headers` lists the rate headers, `X-Spore-Tier` and `ETag`; a preflight is answered 204 before auth and rate limits. /api/* keeps its allowlist.
+- Caching: family/tree/map/heat send `Cache-Control: public, max-age=5, s-maxage=10` + weak ETag (304 on If-None-Match), so a CDN absorbs polling; openapi.json `public, max-age=300, s-maxage=3600`; errors and the stream `no-store`. A CDN-cached response may carry an earlier caller's rate headers; the limits are enforced at the origin.
+- Costs: family is cached 5 s per mint, a tree 10 s per root (or per model version), the map/heat reuse the §11.5 caches; the /v1 map bytes are the /api bytes with `"image":"/api/img?` rewritten once per build.
+
+### 12.4 Embeds
+
+`/embed/tree/:mint` and `/embed/map[?focus=<mint>]` are pages of the web app rendered without the site shell (no nav, footer, official strip or background canvas), fitting any iframe size (min 320×240), `?theme=dark|light` (default dark), `?hideHeader=1`. They show the family tree / ecosystem map (BubbleMap and the map data layer), a compact header "Family tree · <$TICKER>" with a "Launch under on Spore ↗" button and a small "Powered by Spore" link; both open https://sporepad.com in a new tab and never navigate the parent. The server serves index.html for `/embed` and `/embed/*` with `frame-ancestors *` and **no** `X-Frame-Options`; every other path keeps `frame-ancestors 'none'` + `X-Frame-Options: DENY`.
+
+### 12.5 Docs
+
+Web page `/docs/api` (footer link "API", linked from /how): what the data is, quick start (curl, JS fetch, SSE) with real mints such as $SPORE `HfzNFxar7oggDCHnK2ekkygDsLNuCGh3dXdRQS3wJTJY`, every endpoint with params and an example response, tiers and limits, how to get a key (X @Sporemap, team@sporepad.com), the embed section (live preview iframe, snippet generator with theme toggle), attribution terms ("Data by Spore" + link required; free tier; partner keys on request) and a link to `/v1/openapi.json`.

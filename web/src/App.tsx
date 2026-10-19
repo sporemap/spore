@@ -18,6 +18,10 @@ import How from "./pages/How";
 import Fees from "./pages/Fees";
 import Claim from "./pages/Claim";
 import NotFound from "./pages/NotFound";
+import ApiDocs from "./pages/ApiDocs";
+import EmbedTree from "./pages/embed/EmbedTree";
+import EmbedMap from "./pages/embed/EmbedMap";
+import { EmbedNotFound } from "./pages/embed/common";
 import "./components/brand.css";
 
 export const BRAND = { name: "Spore", tagline: "Coins that grow coins.", title: "Spore — coins that grow coins" };
@@ -163,6 +167,7 @@ function Shell() {
             <Route path="/how" element={<How />} />
             <Route path="/fees" element={<Fees />} />
             <Route path="/claim" element={<Claim />} />
+            <Route path="/docs/api" element={<ApiDocs />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </div>
@@ -179,6 +184,7 @@ function Shell() {
             <nav className="footer-nav" aria-label="Footer">
               {PRIMARY.map(([to, label]) => <NavLink key={to} to={to}>{label}</NavLink>)}
               <NavLink to="/fees">Fees &amp; rules</NavLink>
+              <NavLink to="/docs/api">API</NavLink>
             </nav>
           </div>
           <div className="footer-col">
@@ -204,6 +210,20 @@ function Shell() {
   );
 }
 
+/// Embeds (DESIGN §12) render outside the site shell: no nav, footer, official strip, toasts or
+/// shortcuts, just the widget filling a partner's iframe. Any other /embed/ path is a small 404.
+function Embeds() {
+  return (
+    <Routes>
+      <Route path="/embed/tree/:mint" element={<EmbedTree />} />
+      <Route path="/embed/map" element={<EmbedMap />} />
+      <Route path="*" element={<EmbedNotFound />} />
+    </Routes>
+  );
+}
+
 export default function App() {
+  const loc = useLocation();
+  if (loc.pathname === "/embed" || loc.pathname.startsWith("/embed/")) return <Embeds />;
   return <ToastProvider><Shell /></ToastProvider>;
 }

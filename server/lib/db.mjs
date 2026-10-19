@@ -57,15 +57,25 @@ CREATE TABLE IF NOT EXISTS uploads (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, pair TEXT, ip TEXT, bytes INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS uploads_at ON uploads(at);
+CREATE TABLE IF NOT EXISTS api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT, hash TEXT NOT NULL UNIQUE,
+  tier TEXT NOT NULL DEFAULT 'partner', created_at INTEGER NOT NULL, revoked_at INTEGER, last_used_at INTEGER,
+  requests INTEGER NOT NULL DEFAULT 0
+);
 `;
 
 const now = () => Math.floor(Date.now() / 1000);
 
 export class Db {
-  constructor(file) {
+  /**
+   * `busyMs`: how long a write waits for another connection's write lock before failing. The API-key
+   * CLI (scripts/keys.mjs) writes to the same file as the running server; its transactions take
+   * well under a millisecond, so a short wait turns a would-be SQLITE_BUSY into a tiny pause.
+   */
+  constructor(file, { busyMs = 2_000 } = {}) {
     if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA temp_store = MEMORY;");
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyMs))}; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA temp_store = MEMORY;`);
     this.migrate();
     this.#prepare();
   }
@@ -84,6 +94,7 @@ export class Db {
       if (!this.db.prepare("PRAGMA table_info(meta)").all().some((c) => c.name === "attempts")) this.db.exec("ALTER TABLE meta ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
       this.db.exec("UPDATE coins SET updated_at = updated_at * 1000 WHERE updated_at > 0 AND updated_at < 100000000000");
     }
+    // `api_keys` (partner API keys, DESIGN §12) is a new table only, so CREATE IF NOT EXISTS above is its migration.
     if (current < SCHEMA_VERSION) this.db.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   }
 
@@ -137,6 +148,13 @@ export class Db {
       uploadDelete: p("DELETE FROM uploads WHERE name = ?"),
       uploadPairCount: p("SELECT COUNT(*) AS n FROM uploads WHERE kind = 'json' AND pair = ?"),
       uploadCount: p("SELECT COUNT(*) AS n FROM uploads"),
+      priceBefore: p("SELECT price_quote, price_usd, time FROM trades WHERE mint = ? AND time <= ? ORDER BY time DESC, rowid DESC LIMIT 1"),
+      priceAfter: p("SELECT price_quote, price_usd, time FROM trades WHERE mint = ? AND time > ? ORDER BY time ASC, rowid ASC LIMIT 1"),
+      keyInsert: p("INSERT INTO api_keys (name, contact, hash, tier, created_at) VALUES (?, ?, ?, ?, ?)"),
+      keyByHash: p("SELECT id, name, tier, revoked_at FROM api_keys WHERE hash = ?"),
+      keysAll: p("SELECT id, name, contact, tier, created_at, revoked_at, last_used_at, requests FROM api_keys ORDER BY id"),
+      keyRevoke: p("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL"),
+      keyUsage: p("UPDATE api_keys SET requests = requests + ?, last_used_at = MAX(COALESCE(last_used_at, 0), ?) WHERE id = ?"),
     };
   }
 
@@ -217,6 +235,20 @@ export class Db {
   uploadForget(name) { this.q.uploadDelete.run(name); }
   uploadsUsingImage(name) { return this.q.uploadPairCount.get(name).n; }
   uploadCount() { return this.q.uploadCount.get().n; }
+
+  /**
+   * The price a coin last traded at, at or before `t` (unix s), else its first trade after `t`:
+   * the reference of a 24 h change (the second case is a coin whose history starts inside the window).
+   */
+  priceRef(mint, t) { const r = this.q.priceBefore.get(mint, t) ?? this.q.priceAfter.get(mint, t); return r ? { priceQuote: r.price_quote, priceUsd: r.price_usd, time: r.time } : null; }
+
+  // Partner API keys (lib/apikeys.mjs owns the logic; only the sha256 of a key is ever stored).
+  apiKeyInsert({ name, contact = null, hash, tier = "partner", createdAt = now() }) { return Number(this.q.keyInsert.run(name, contact, hash, tier, createdAt).lastInsertRowid); }
+  apiKeyByHash(hash) { const r = this.q.keyByHash.get(hash); return r ? { id: r.id, name: r.name, tier: r.tier, revokedAt: r.revoked_at } : null; }
+  apiKeys() { return this.q.keysAll.all().map((r) => ({ id: r.id, name: r.name, contact: r.contact, tier: r.tier, createdAt: r.created_at, revokedAt: r.revoked_at, lastUsedAt: r.last_used_at, requests: r.requests })); }
+  apiKeyRevoke(id, at = now()) { return Number(this.q.keyRevoke.run(at, id).changes) > 0; }
+  /** Adds batched per-key counters (`[{ id, requests, lastUsedAt }]`) in one transaction. */
+  apiKeyUsage(rows) { if (rows.length) this.transaction(() => { for (const r of rows) this.q.keyUsage.run(r.requests, r.lastUsedAt, r.id); }); }
 
   /** Folds the WAL into the main file so a shutdown (or a file-level copy) leaves one complete file. */
   checkpoint() { try { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* read-only or already closed */ } }

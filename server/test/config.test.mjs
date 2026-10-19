@@ -55,3 +55,19 @@ test("every bad value is reported at once, by name, with the fix", () => {
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("partner API (DESIGN §12): PUBLIC_URL must be an origin; tier limits default to 60/1200 per minute and 2/20 streams", () => {
+  const dir = tmp();
+  try {
+    const env = { DATA_DIR: join(dir, "d"), META_DIR: join(dir, "m") };
+    const c = loadConfig(env, { here: dir });
+    assert.equal(c.publicUrl, "https://sporepad.com");
+    assert.deepEqual(c.v1Limits, { publicPerMin: 60, partnerPerMin: 1200, publicStreams: 2, partnerStreams: 20, maxStreams: 2000 });
+    const o = loadConfig({ ...env, PUBLIC_URL: "http://localhost:8796/", V1_RATE_PUBLIC: "5", V1_RATE_PARTNER: "50", V1_STREAMS_PUBLIC: "1", V1_STREAMS_PARTNER: "3", V1_STREAMS_MAX: "10" }, { here: dir });
+    assert.equal(o.publicUrl, "http://localhost:8796");
+    assert.deepEqual(o.v1Limits, { publicPerMin: 5, partnerPerMin: 50, publicStreams: 1, partnerStreams: 3, maxStreams: 10 });
+    assert.throws(() => loadConfig({ ...env, PUBLIC_URL: "https://sporepad.com/app" }, { here: dir }), /PUBLIC_URL="https:\/\/sporepad.com\/app" must be an origin/);
+    assert.throws(() => loadConfig({ ...env, PUBLIC_URL: "ftp://x.example" }, { here: dir }), /PUBLIC_URL must be a http\/https URL/);
+    assert.throws(() => loadConfig({ ...env, V1_RATE_PUBLIC: "0" }, { here: dir }), /V1_RATE_PUBLIC="0" must be an integer ≥ 1/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

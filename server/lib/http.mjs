@@ -58,9 +58,11 @@ export const DEFAULT_CSP_HOSTS = { fonts: ["https://fonts.googleapis.com", "http
  * 'unsafe-inline' because React, d3 and lightweight-charts set style attributes; connect-src is
  * same-origin only (the RPC goes through /api/rpc, the SSE stream is /api/events), plus the
  * metadata host; images are our proxy, data: (wallet icons) and the metadata host; Solflare's
- * web wallet runs in an iframe. Nothing may frame us.
+ * web wallet runs in an iframe, and frame-src 'self' lets /docs/api preview the /embed widgets
+ * (every other path of ours refuses to be framed by its own frame-ancestors). Nothing else may
+ * frame us.
  */
-export function buildCsp({ nonce, pagesDomain = null, extraConnect = [], extraFrames = [] } = {}) {
+export function buildCsp({ nonce, pagesDomain = null, extraConnect = [], extraFrames = [], frameAncestors = "'none'" } = {}) {
   const pages = pagesDomain ? [`https://${pagesDomain}`] : [];
   const d = [
     "default-src 'self'",
@@ -69,16 +71,23 @@ export function buildCsp({ nonce, pagesDomain = null, extraConnect = [], extraFr
     `font-src 'self' data: ${DEFAULT_CSP_HOSTS.fonts[1]}`,
     `img-src 'self' data: blob: ${pages.join(" ")}`.trim(),
     `connect-src 'self' ${[...pages, ...extraConnect].join(" ")}`.trim(),
-    `frame-src ${[...DEFAULT_CSP_HOSTS.frames, ...extraFrames].join(" ")}`,
+    `frame-src 'self' ${[...DEFAULT_CSP_HOSTS.frames, ...extraFrames].join(" ")}`,
     "worker-src 'self' blob:",
     "media-src 'self' data: blob:",
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
-    "frame-ancestors 'none'",
+    `frame-ancestors ${frameAncestors}`,
   ];
   return d.join("; ");
 }
+/**
+ * The embeddable widgets (DESIGN §12: `/embed/tree/:mint`, `/embed/map`) are the one part of the
+ * site any page may frame; every other path keeps `frame-ancestors 'none'` + `X-Frame-Options: DENY`.
+ * They are read-only views (no wallet, no transaction), and their links open sporepad.com in a new
+ * tab, so a framing page cannot drive an action through them.
+ */
+export const isEmbedPath = (p) => p === "/embed" || String(p).startsWith("/embed/");
 export const API_CSP = "default-src 'none'; frame-ancestors 'none'";
 
 /**
@@ -103,10 +112,11 @@ export function securityHeaders({ hsts = "auto" } = {}) {
   };
 }
 
-/** CORS for an explicit allowlist of origins (a separate dev host); production is same-origin. */
+/** CORS for an explicit allowlist of origins (a separate dev host); production is same-origin. /v1 has its own (`v1Cors`). */
 export function cors(origins = []) {
   const allowed = new Set(origins);
   return (req, res, next) => {
+    if (isV1Path(req.path)) return next();
     const origin = req.headers.origin;
     if (origin && allowed.has(origin)) {
       res.setHeader("access-control-allow-origin", origin);
@@ -116,6 +126,25 @@ export function cors(origins = []) {
       res.setHeader("access-control-max-age", "600");
     }
     if (req.method === "OPTIONS" && req.path.startsWith("/api/")) return res.sendStatus(204);
+    next();
+  };
+}
+
+export const isV1Path = (p) => p === "/v1" || String(p).startsWith("/v1/");
+export const V1_EXPOSED_HEADERS = "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Policy, X-Spore-Tier, Retry-After, ETag";
+/**
+ * CORS for the public read-only API (DESIGN §12): any origin, GET only, no credentials, so a
+ * trading terminal can call it straight from the browser. Nothing under /v1 reads a cookie or
+ * changes state, which is what makes `*` safe here while /api keeps its allowlist. A preflight is
+ * answered here, before authentication and rate limiting (it carries no key).
+ */
+export function v1Cors({ maxAge = 86_400 } = {}) {
+  return (req, res, next) => {
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("access-control-allow-methods", "GET, OPTIONS");
+    res.setHeader("access-control-allow-headers", "X-API-Key, Content-Type");
+    res.setHeader("access-control-expose-headers", V1_EXPOSED_HEADERS);
+    if (req.method === "OPTIONS") { res.setHeader("access-control-max-age", String(maxAge)); res.setHeader("cache-control", "public, max-age=86400"); return res.status(204).end(); }
     next();
   };
 }
@@ -229,11 +258,11 @@ export const etagOf = (body) => `W/"${createHash("sha1").update(body).digest("ba
  * tick, so a few seconds of caching lets a CDN or a browser tab absorb repeat loads, and an
  * If-None-Match hit costs nothing but the hash.
  */
-export function sendCachedJson(req, res, body, { maxAge = 5, swr = maxAge * 4 } = {}) {
+export function sendCachedJson(req, res, body, { maxAge = 5, swr = maxAge * 4, cacheControl = null } = {}) {
   const text = JSON.stringify(body);
   const tag = etagOf(text);
   res.setHeader("etag", tag);
-  res.setHeader("cache-control", `public, max-age=${maxAge}, stale-while-revalidate=${swr}`);
+  res.setHeader("cache-control", cacheControl ?? `public, max-age=${maxAge}, stale-while-revalidate=${swr}`);
   if (req.headers["if-none-match"] === tag) return res.status(304).end();
   res.type("application/json").send(text);
 }
@@ -243,8 +272,9 @@ export function sendCachedJson(req, res, body, { maxAge = 5, swr = maxAge * 4 } 
  * brotli bytes. The whole-forest map is ~5 MB of JSON for 15k coins; compressing it per request
  * would cost more than building it, so the cache entry holds the bytes for the 10 s it lives.
  */
-export function prepareJson(body, { brotliQuality = 4, gzipLevel = 6 } = {}) {
-  const text = JSON.stringify(body);
+export function prepareJson(body, opts = {}) { return prepareJsonText(JSON.stringify(body), opts); }
+/** `prepareJson` for a body that is already JSON text (the /v1 map rewrites the /api bytes, DESIGN §12). */
+export function prepareJsonText(text, { brotliQuality = 4, gzipLevel = 6 } = {}) {
   const buf = Buffer.from(text, "utf8");
   const p = { text, bytes: buf, etag: etagOf(text), br: null, gz: null };
   p.encoded = (enc) => {
@@ -255,9 +285,9 @@ export function prepareJson(body, { brotliQuality = 4, gzipLevel = 6 } = {}) {
   return p;
 }
 /** Sends a `prepareJson` result with the cache headers of `sendCachedJson`, pre-encoded for the client's accept-encoding. */
-export function sendPrepared(req, res, prepared, { maxAge = 5, swr = maxAge * 4 } = {}) {
+export function sendPrepared(req, res, prepared, { maxAge = 5, swr = maxAge * 4, cacheControl = null } = {}) {
   res.setHeader("etag", prepared.etag);
-  res.setHeader("cache-control", `public, max-age=${maxAge}, stale-while-revalidate=${swr}`);
+  res.setHeader("cache-control", cacheControl ?? `public, max-age=${maxAge}, stale-while-revalidate=${swr}`);
   if (req.headers["if-none-match"] === prepared.etag) return res.status(304).end();
   const enc = req.method === "HEAD" ? null : encodingOf(req);
   const out = enc && prepared.bytes.length >= 1024 ? prepared.encoded(enc) : prepared.bytes;
@@ -267,10 +297,14 @@ export function sendPrepared(req, res, prepared, { maxAge = 5, swr = maxAge * 4 
   res.end(out);
 }
 
-/** Serves index.html with the SPA CSP and the per-request nonce substituted into `__CSP_NONCE__`. */
-export function sendSpaHtml(res, html, { pagesDomain, extraConnect = [], extraFrames = [] } = {}) {
+/**
+ * Serves index.html with the SPA CSP and the per-request nonce substituted into `__CSP_NONCE__`.
+ * `embed` (an /embed/* path) lets any page frame it: `frame-ancestors *` and no X-Frame-Options.
+ */
+export function sendSpaHtml(res, html, { pagesDomain, extraConnect = [], extraFrames = [], embed = false } = {}) {
   const nonce = res.locals.cspNonce;
-  res.setHeader("content-security-policy", buildCsp({ nonce, pagesDomain, extraConnect, extraFrames }));
+  res.setHeader("content-security-policy", buildCsp({ nonce, pagesDomain, extraConnect, extraFrames, frameAncestors: embed ? "*" : "'none'" }));
+  if (embed) res.removeHeader("x-frame-options");
   res.setHeader("cache-control", "no-cache");
   res.type("html").send(html.includes("__CSP_NONCE__") ? html.replaceAll("__CSP_NONCE__", nonce) : html);
 }

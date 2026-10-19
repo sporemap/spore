@@ -13,7 +13,9 @@ import { verifySpawnTx } from "./spawned.mjs";
 import { shareOf, claimTotals } from "./treasury.mjs";
 import { fromBase58 } from "./decode.mjs";
 import { launchFeeOf, DEFAULT_LAUNCH_FEE_SOL, splitShares } from "./pricing.mjs";
-import { securityHeaders, cors, rateLimit, requestLog, compression, sendCachedJson, sendSpaHtml, prepareJson, sendPrepared, RateLimiter } from "./http.mjs";
+import { securityHeaders, cors, rateLimit, requestLog, compression, sendCachedJson, sendSpaHtml, prepareJson, sendPrepared, RateLimiter, isEmbedPath } from "./http.mjs";
+import { createV1, DEFAULT_PUBLIC_URL } from "./v1.mjs";
+import { ApiKeys } from "./apikeys.mjs";
 import { uploadFields, imageFromDataUrl, LIMITS } from "./validate.mjs";
 import { DEFAULT_RATES } from "./config.mjs";
 
@@ -96,7 +98,7 @@ export function buildCandles(trades, res) {
  * socket has been down for a while or the refresh loop stalled; `?strict=1` makes that a 503 so a
  * probe can act on it, while the default stays 200 so a glance always gets the numbers.
  */
-export function healthOf({ model, indexer, hub, images, meta, metahost, treasury, rpc, startedAt }) {
+export function healthOf({ model, indexer, hub, images, meta, metahost, treasury, rpc, startedAt, v1 = null }) {
   const snap = indexer?.snapshot?.() ?? {};
   const now = nowS(), uptimeS = now - startedAt;
   const ws = snap.live ?? null;
@@ -113,12 +115,12 @@ export function healthOf({ model, indexer, hub, images, meta, metahost, treasury
     activity: model.activity ? { ...model.activity.size(), seededMs: model.activity.seededMs ?? null } : null,
     rpc: rpc?.snapshot?.() ?? snap.rpc ?? null, rpcLanes: rpc?.laneSnapshot?.() ?? null, meta: meta?.snapshot?.() ?? meta?.stats ?? snap.meta ?? null, images: images?.stats ?? null,
     metahost: metahost ? { ...metahost.stats, quota: metahost.quota?.snapshot?.() ?? null } : null, treasury: treasury?.stats ?? null,
-    sse: hub?.clients?.size ?? 0, sseStats: hub?.stats ?? null, solUsd: model.solUsd, memoryMb: { rss: Math.round(mem.rss / 1e6), heap: Math.round(mem.heapUsed / 1e6) },
+    sse: hub?.clients?.size ?? 0, sseStats: hub?.stats ?? null, v1: v1?.snapshot?.() ?? null, solUsd: model.solUsd, memoryMb: { rss: Math.round(mem.rss / 1e6), heap: Math.round(mem.heapUsed / 1e6) },
   };
 }
 
 export function createApp({ model, indexer, rpc, hub, images, meta, metahost = null, treasury = null, metaDir = null, platformWallet, splitBps, launchFeeSol = DEFAULT_LAUNCH_FEE_SOL, distDir, origins = [], log = console,
-  rates = null, trustProxy = "loopback", hsts = "auto", logSample = 0.1, pagesDomain = null, cspConnect = [], now = Date.now }) {
+  rates = null, trustProxy = "loopback", hsts = "auto", logSample = 0.1, pagesDomain = null, cspConnect = [], apiKeys = null, publicUrl = DEFAULT_PUBLIC_URL, v1Limits = {}, now = Date.now }) {
   const app = express();
   const startedAt = nowS();
   const launchFee = launchFeeOf(launchFeeSol, platformWallet);
@@ -146,10 +148,13 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   const view = (c) => model.view(c);
   const spawns = () => model.visibleSpawns();
+  // Partner API (DESIGN §12): read-only, CORS *, keyed tiers, its own rate limits and stream.
+  const v1 = createV1({ model, indexer, apiRpc, hub, meta, apiKeys: apiKeys ?? new ApiKeys(model.db, { log }), isMint, publicUrl, limits: v1Limits, log, now });
+  app.locals.v1 = v1;
 
   app.get("/api/stats", (req, res) => sendCachedJson(req, res, model.stats(), { maxAge: 3 }));
   app.get("/api/health", (req, res) => {
-    const h = healthOf({ model, indexer, hub, images, meta, metahost, treasury, rpc, startedAt });
+    const h = healthOf({ model, indexer, hub, images, meta, metahost, treasury, rpc, startedAt, v1 });
     res.status(!h.ok && req.query.strict != null ? 503 : 200).json(h);
   });
 
@@ -454,21 +459,23 @@ export function createApp({ model, indexer, rpc, hub, images, meta, metahost = n
     } catch (e) { res.status(502).json({ error: `rpc unreachable: ${e.message}` }); }
   }));
 
+  app.use("/v1", v1.router);
   app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
 
   // Production: the built web app from the same origin. Hashed assets are immutable; index.html is
-  // revalidated every time and sent with the SPA CSP (and the nonce for its inline theme snippet).
+  // revalidated every time and sent with the SPA CSP (and the nonce for its inline theme snippet);
+  // /embed/* is the same page with a CSP any site may frame (DESIGN §12), every other path is unframeable.
   const indexFile = distDir ? join(distDir, "index.html") : null;
   if (indexFile && existsSync(indexFile)) {
     let html = { text: null, mtimeMs: 0 };
     const indexHtml = () => { const st = statSync(indexFile); if (st.mtimeMs !== html.mtimeMs) html = { text: readFileSync(indexFile, "utf8"), mtimeMs: st.mtimeMs }; return html.text; };
-    const sendIndex = (_req, res) => sendSpaHtml(res, indexHtml(), { pagesDomain, extraConnect: cspConnect });
+    const sendIndex = (req, res) => sendSpaHtml(res, indexHtml(), { pagesDomain, extraConnect: cspConnect, embed: isEmbedPath(req.path) });
     app.get("/", sendIndex);
     app.use(express.static(distDir, { index: false, fallthrough: true, setHeaders: (res, p) => {
       if (p.includes(`${join(distDir, "assets")}/`)) res.setHeader("cache-control", "public, max-age=31536000, immutable");
       else res.setHeader("cache-control", "public, max-age=3600");
     } }));
-    app.get(/^(?!\/api(\/|$)).*/, (req, res) => (req.path.includes(".") ? res.status(404).type("text").send("not found") : sendIndex(req, res)));
+    app.get(/^(?!\/(api|v1)(\/|$)).*/, (req, res) => (req.path.includes(".") ? res.status(404).type("text").send("not found") : sendIndex(req, res)));
     log.info?.(`serving ${distDir}`);
   }
 

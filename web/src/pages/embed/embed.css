@@ -1,0 +1,171 @@
+/* Embeds (DESIGN §12): /embed/tree/:mint and /embed/map inside a partner's iframe. Everything is scoped
+   to .embed (or html.embed-doc, which common.tsx sets while an embed is mounted), so nothing here reaches
+   the site. The frame fills the iframe at any size down to 320×240; the body is a size container and the
+   compact rules below match compactBox() in common.tsx (body < 560 wide or < 340 tall).
+   Themes: dark is the site's own tokens; light redefines them on .embed[data-theme="light"], which the
+   map's overlays (controls, size toggle, legend, tooltips) read too. The map canvas itself is drawn with
+   the site's dark palette (BubbleMap has no light palette: neon rings and dark-outlined labels), so in
+   the light theme it sits on a deep "night" panel inset in the light frame instead of on white. */
+html.embed-doc, html.embed-doc body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+html.embed-doc body { min-width: 0; background: var(--bg-0); }
+html.embed-doc #root { height: 100%; }
+html.embed-doc .bg { display: none; }
+html.embed-doc[data-embed-theme="light"], html.embed-doc[data-embed-theme="light"] body { color-scheme: light; background: #f4f7f1; }
+
+.embed { position: relative; isolation: isolate; display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow: hidden;
+  background: var(--bg-0); color: var(--ink); font-family: var(--sans); font-size: 13px; line-height: 1.4; }
+.embed[data-theme="light"] {
+  color-scheme: light;
+  --bg-0: #f4f7f1; --bg-1: #ffffff; --bg-2: #eaf0e6; --bg-3: #dfe8d9;
+  --glass: rgba(14,40,20,.04); --glass-2: rgba(14,40,20,.06); --glass-3: rgba(14,40,20,.1);
+  --line: rgba(44,96,12,.18); --line-2: rgba(44,96,12,.34); --line-soft: rgba(14,40,20,.09);
+  --ink: #0c1a10; --ink-2: #26392c; --muted: #4a5f50; --faint: #5a6f60;
+  --accent: #3b7a06; --accent-2: #2e6300; --accent-soft: rgba(96,170,24,.14); --accent-ink: #06120a; --accent-rgb: 59,122,6;
+  --violet: #6a43d4; --violet-2: #5933bf; --violet-soft: rgba(106,67,212,.1); --violet-rgb: 106,67,212;
+  --teal: #0c7f6c; --teal-2: #0a6f5f; --teal-soft: rgba(12,127,108,.1); --teal-rgb: 12,127,108;
+  --good: #11804a; --good-soft: rgba(17,128,74,.1); --warn: #8f6200; --warn-soft: rgba(143,98,0,.1); --bad: #c22a3c; --bad-soft: rgba(194,42,60,.08);
+  --bg: var(--bg-0); --text: var(--ink); --card: var(--glass);
+  --shadow: 0 1px 0 rgba(255,255,255,.8) inset, 0 18px 40px -26px rgba(12,30,16,.35);
+  --shadow-pop: 0 24px 60px -24px rgba(12,30,16,.4), 0 0 0 1px rgba(44,96,12,.08);
+}
+.embed a:hover { text-decoration: none; }
+.embed :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- header: title · meta · call to action */
+.embed-head { flex: none; container: embhead / inline-size; display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 8px 0 12px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-1) 96%, transparent), color-mix(in srgb, var(--bg-0) 96%, transparent)); }
+/* the ticker keeps its width; the meta line only takes the space left over (zero basis) and hides on narrow headers */
+.embed-title { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 0 1 auto; }
+.embed-title .logo { width: 22px; height: 22px; }
+.embed-title h1 { display: flex; align-items: baseline; gap: 6px; min-width: 0; margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.2; white-space: nowrap; }
+.embed-title h1 > span { flex: none; }
+.embed-title h1 i { font-style: normal; color: var(--faint); flex: none; }
+.embed-title h1 b { font-family: var(--mono); font-weight: 600; color: var(--accent); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.embed-sk { display: inline-block; width: 52px; height: 11px; border-radius: 6px; background: linear-gradient(90deg, var(--glass-2), var(--glass-3), var(--glass-2)); background-size: 200% 100%; animation: embed-sk 1.2s linear infinite; }
+@keyframes embed-sk { to { background-position: -200% 0; } }
+.embed-meta { min-width: 0; flex: 1 1 0; margin: 0; font-family: var(--mono); font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.embed-meta b { color: var(--ink-2); font-weight: 500; font-variant-numeric: tabular-nums; }
+.embed-head-acts { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
+.embed-cta { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 13px; border-radius: 999px; white-space: nowrap; font-size: 12.5px; font-weight: 600;
+  color: #06120a; border: 1px solid rgba(182,255,92,.75); background: linear-gradient(180deg, #c9ff84, #b6ff5c 55%, #a6f24c);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 8px 24px -12px rgba(182,255,92,.7); transition: filter .15s, box-shadow .15s; }
+.embed-cta:hover { filter: brightness(1.06); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), 0 10px 28px -10px rgba(182,255,92,.85); }
+.embed-cta.ghost { color: var(--ink); background: var(--glass-2); border-color: var(--line-2); box-shadow: none; }
+.embed-cta.ghost:hover { border-color: var(--accent); filter: none; }
+.embed[data-theme="light"] .embed-cta:not(.ghost) { border-color: rgba(59,122,6,.45); box-shadow: inset 0 1px 0 rgba(255,255,255,.5), 0 6px 18px -10px rgba(59,122,6,.55); }
+.embed-arrow { font-size: 0.95em; line-height: 1; opacity: .8; }
+
+/* ---------- body: the map fills it; overlays sit on top */
+.embed-body { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; container: embody / size; }
+.embed-body > .bm { position: absolute; inset: 0; width: auto; height: auto !important; border-radius: 0; }
+/* light theme: the canvas keeps its dark palette, so it is a rounded night panel inside the light frame */
+.embed[data-theme="light"] .embed-body > .bm { inset: 6px; border-radius: 12px; box-shadow: 0 0 0 1px rgba(12,40,18,.18), 0 14px 34px -20px rgba(12,30,16,.55); }
+/* everything drawn over the panel (its own controls, and this file's toggle, card, note and credit) uses
+   the panel's dark tokens, so the night panel reads as one surface */
+.embed[data-theme="light"] .embed-body > .bm, .embed[data-theme="light"] .embed-view, .embed[data-theme="light"] .embed-sel,
+.embed[data-theme="light"] .embed-note, .embed[data-theme="light"] .embed-powered { --bg-0: #07100b; --bg-1: #0b1a12; --bg-3: #14301f; --ink: #e8f3e8; --ink-2: #c6d9c9; --muted: #8ea596; --faint: #74907b;
+  --line: rgba(182,255,92,.12); --line-2: rgba(182,255,92,.24); --line-soft: rgba(255,255,255,.07); --glass: rgba(255,255,255,.04); --glass-2: rgba(255,255,255,.07); --glass-3: rgba(255,255,255,.1);
+  --accent: #b6ff5c; --accent-soft: rgba(182,255,92,.12); --violet: #b08cff; --violet-2: #c7adff; --violet-soft: rgba(176,140,255,.14); --teal: #5ce0c8; --teal-soft: rgba(92,224,200,.14);
+  --good: #5ee39a; --shadow-pop: 0 30px 70px -20px rgba(0,0,0,.9), 0 0 0 1px rgba(182,255,92,.06); color-scheme: dark; color: var(--ink); }
+/* BubbleMap's own overlays: zoom bottom-right, size toggle top-right, legend above "Powered by". The
+   selectors out-rank bubblemap.css's narrow-viewport rules, which move the toggle next to the zoom
+   buttons on the /map page (an iframe's viewport is the frame, so those rules fire in small embeds). */
+.embed .bm.bm-full .bm-legend { left: 10px; bottom: 44px; }
+.embed .bm.bm-full .bm-controls { right: 10px; bottom: 10px; }
+.embed .bm.bm-full .bm-size { top: 10px; bottom: auto; right: 10px; }
+
+.embed-powered { position: absolute; left: 10px; bottom: 10px; z-index: 6; display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 10px 0 9px; border-radius: 999px;
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--bg-0) 84%, transparent); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  font-size: 11px; color: var(--muted); white-space: nowrap; transition: color .15s, border-color .15s; }
+.embed-powered b { color: var(--ink); font-weight: 600; }
+.embed-powered .mark { margin: 0 -1px; }
+.embed-powered:hover { color: var(--ink); border-color: var(--line-2); }
+.embed[data-theme="light"] .embed-powered { left: 14px; bottom: 14px; }
+
+/* ---------- branch / whole tree toggle (tree embed, when the coin has siblings) */
+.embed-view { position: absolute; left: 10px; top: 10px; z-index: 6; align-items: center; background: color-mix(in srgb, var(--bg-0) 84%, transparent); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+.embed-view button { height: 24px; padding: 0 10px; font-size: 11px; }
+.embed-view b { font-weight: 500; opacity: .7; margin-left: 3px; font-variant-numeric: tabular-nums; }
+.embed[data-theme="light"] .embed-view { left: 14px; top: 14px; }
+
+/* ---------- selected coin */
+.embed-sel { position: absolute; left: 10px; top: 10px; z-index: 7; display: grid; gap: 8px; width: min(332px, calc(100% - 20px)); padding: 10px 12px 11px; border-radius: 14px;
+  border: 1px solid var(--line-2); background: color-mix(in srgb, var(--bg-1) 94%, transparent); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-pop); animation: embed-in .16s var(--ease) both; }
+.embed[data-theme="light"] .embed-sel { left: 14px; top: 14px; width: min(332px, calc(100% - 28px)); }
+.embed-view ~ .embed-sel { top: 44px; }
+.embed[data-theme="light"] .embed-view ~ .embed-sel { top: 48px; }
+@keyframes embed-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.embed-sel-top { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.embed-sel-name { display: grid; gap: 1px; min-width: 0; }
+.embed-sel-name > b { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.embed-sel-name > span { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; color: var(--muted); }
+.embed-depth { display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 999px; font-family: var(--mono); font-size: 10px; font-weight: 600; border: 1px solid var(--line-2); color: var(--accent); background: var(--accent-soft); }
+.embed-depth.d1 { color: var(--teal); border-color: color-mix(in srgb, var(--teal) 40%, transparent); background: var(--teal-soft); }
+.embed-depth.d2, .embed-depth.d3 { color: var(--violet-2); border-color: color-mix(in srgb, var(--violet) 40%, transparent); background: var(--violet-soft); }
+.embed-ours { display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 999px; font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--accent-ink); background: #b6ff5c; }
+.embed-x { width: 26px; height: 26px; display: grid; place-items: center; padding: 0; border-radius: 50%; border: 1px solid var(--line-soft); background: var(--glass); color: var(--muted); font-size: 16px; line-height: 1; }
+.embed-x:hover { color: var(--ink); border-color: var(--line-2); }
+.embed-sel-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+.embed-sel-stats div { display: grid; gap: 1px; min-width: 0; }
+.embed-sel-stats dt { font-family: var(--mono); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+.embed-sel-stats dd { margin: 0; font-family: var(--mono); font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.embed-sel-under { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: -2px; }
+.embed-sel-under b { color: var(--violet-2); font-weight: 500; }
+.embed-sel-acts { display: flex; flex-wrap: wrap; gap: 5px; }
+.embed-btn { display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 9px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--glass-2); color: var(--ink);
+  font-size: 12px; font-weight: 500; white-space: nowrap; transition: border-color .15s, background .15s; }
+.embed-btn:hover { border-color: var(--accent); background: var(--glass-3); }
+.embed-btn.accent { color: #06120a; font-weight: 600; border-color: rgba(182,255,92,.75); background: linear-gradient(180deg, #c9ff84, #b6ff5c 55%, #a6f24c); }
+.embed-btn.accent:hover { filter: brightness(1.06); }
+.embed-btn.ghost { background: transparent; }
+
+/* ---------- notes, states, loading */
+.embed-note { position: absolute; left: 50%; bottom: 44px; z-index: 6; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; max-width: calc(100% - 20px); padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line-2); background: color-mix(in srgb, var(--bg-1) 92%, transparent); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); box-shadow: var(--shadow-pop);
+  font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.embed-note > span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.embed-link { color: var(--accent); font-weight: 600; flex: none; }
+.embed-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.embed-state { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 20px 20px 48px; text-align: center; }
+.embed-state b { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.embed-state p { max-width: 380px; font-size: 12.5px; color: var(--muted); }
+.embed-state code { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+.embed-state.bad b { color: var(--bad); }
+.embed-state-acts { display: flex; gap: 8px; margin-top: 4px; }
+.embed-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; padding-bottom: 24px; }
+.embed-loading i { width: 9px; height: 9px; border-radius: 50%; background: #b6ff5c; box-shadow: 0 0 14px rgba(182,255,92,.7); animation: embed-pulse 1.1s ease-in-out infinite; }
+.embed-loading i:nth-child(2) { background: #5ce0c8; box-shadow: 0 0 14px rgba(92,224,200,.7); animation-delay: .15s; }
+.embed-loading i:nth-child(3) { background: #b08cff; box-shadow: 0 0 14px rgba(176,140,255,.7); animation-delay: .3s; }
+@keyframes embed-pulse { 0%, 100% { transform: scale(.6); opacity: .45; } 50% { transform: scale(1); opacity: 1; } }
+
+@container embhead (max-width: 520px) { .embed-meta { display: none; } }
+
+/* ---------- compact body (narrow or short frames): smaller chrome, horizontal zoom controls, no size toggle */
+@container embody (max-width: 559px) or (max-height: 339px) {
+  .bm-size { display: none; }
+  .bm-controls { grid-auto-flow: column; gap: 2px; padding: 3px; }
+  .bm-controls button { width: 28px; height: 28px; font-size: 15px; }
+  .embed-sel { gap: 6px; padding: 8px 10px 9px; width: min(280px, calc(100% - 20px)); }
+  .embed-sel-top { grid-template-columns: 22px minmax(0, 1fr) auto; gap: 8px; }
+  .embed-sel-top .logo { width: 22px !important; height: 22px !important; font-size: 11px !important; }
+  .embed-sel-name > b { font-size: 12.5px; }
+  .embed-sel-stats { display: flex; gap: 10px; padding-top: 5px; }
+  .embed-sel-stats div { display: flex; gap: 4px; align-items: baseline; }
+  .embed-sel-stats dt { font-size: 9px; letter-spacing: .06em; }
+  .embed-sel-stats dd { font-size: 11.5px; }
+  .embed-sel-under { display: none; }
+  .embed-btn { height: 24px; padding: 0 9px; font-size: 11.5px; }
+  .embed-x { width: 22px; height: 22px; font-size: 14px; }
+  .embed-note { bottom: 42px; font-size: 11.5px; padding: 4px 10px; }
+  .embed-state b { font-size: 14px; }
+  .embed-state p { font-size: 12px; }
+}
+@container embody (max-height: 240px) {
+  .embed-sel-stats { display: none; }
+}
+@media (max-width: 420px) {
+  .embed-head { gap: 8px; height: 40px; padding: 0 6px 0 10px; }
+  .embed-title h1 { font-size: 13px; }
+  .embed-cta { height: 28px; padding: 0 11px; font-size: 12px; }
+}
